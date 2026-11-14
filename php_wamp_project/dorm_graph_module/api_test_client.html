@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>تست وب‌سرویس Dormitory Graph API</title>
+    <link rel="stylesheet" href="../assets/fonts/fonts.css" />
+    <link rel="stylesheet" href="../assets/tailwind/tailwind.css" />
+    <style>
+        body { font-family: 'Vazirmatn', sans-serif; background-color: #0b0f19; color: #f1f5f9; }
+    </style>
+</head>
+<body class="p-6 max-w-4xl mx-auto space-y-6">
+
+    <div class="bg-slate-900 border border-slate-800 rounded-3xl p-6 space-y-4 shadow-xl">
+        <div class="flex items-center justify-between border-b border-slate-800 pb-4">
+            <div>
+                <h1 class="text-base font-black text-white flex items-center gap-2">
+                    <span>🔌</span>
+                    <span>کلاینت تست وب‌سرویس API ماژول نقشه خوابگاه (Dormitory Graph)</span>
+                </h1>
+                <p class="text-xs text-slate-400 mt-1">
+                    ارزیابی مستقیم خروجی JSON DTO از اندپوینت <code>get_dorm_graph.php</code> مطابق با سند SRS
+                </p>
+            </div>
+            <button onclick="fetchGraphAPI()" class="px-4 py-2 bg-gradient-to-r from-teal-600 to-emerald-600 hover:from-teal-500 hover:to-emerald-500 text-white rounded-xl text-xs font-bold shadow-lg transition-all cursor-pointer flex items-center gap-2">
+                <span>⚡</span>
+                <span>ارسال درخواست (Fetch API)</span>
+            </button>
+        </div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+            <div class="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
+                <span class="text-[10px] text-slate-400 block">مسیر فراخوانی:</span>
+                <strong class="text-teal-300 font-mono text-[11px] block mt-0.5">get_dorm_graph.php</strong>
+            </div>
+            <div class="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
+                <span class="text-[10px] text-slate-400 block">متد HTTP:</span>
+                <strong class="text-emerald-400 font-mono text-[11px] block mt-0.5">GET</strong>
+            </div>
+            <div class="p-3 bg-slate-800/60 rounded-xl border border-slate-700/60">
+                <span class="text-[10px] text-slate-400 block">وضعیت پاسخ سرور:</span>
+                <strong id="http-status" class="text-slate-400 font-mono text-[11px] block mt-0.5">در انتظار درخواست...</strong>
+            </div>
+        </div>
+
+        <!-- خلاصه آماری نودها و یال‌ها -->
+        <div id="stats-box" class="hidden grid grid-cols-3 gap-3 text-center text-xs">
+            <div class="p-3 bg-blue-950/40 border border-blue-500/30 rounded-xl">
+                <span class="text-[10px] text-blue-300 block">تعداد کل نودها</span>
+                <strong id="node-count" class="text-blue-400 text-sm font-mono font-bold">۰</strong>
+            </div>
+            <div class="p-3 bg-teal-950/40 border border-teal-500/30 rounded-xl">
+                <span class="text-[10px] text-teal-300 block">تعداد یال‌ها (Edges)</span>
+                <strong id="edge-count" class="text-teal-400 text-sm font-mono font-bold">۰</strong>
+            </div>
+            <div class="p-3 bg-amber-950/40 border border-amber-500/30 rounded-xl">
+                <span class="text-[10px] text-amber-300 block">وضعیت اسکان</span>
+                <strong id="status-label" class="text-amber-400 text-sm font-mono font-bold">-</strong>
+            </div>
+        </div>
+
+        <!-- نمایش خروجی خام JSON -->
+        <div class="space-y-2">
+            <div class="flex items-center justify-between">
+                <span class="text-xs font-bold text-slate-300">خروجی خام JSON DTO:</span>
+                <button onclick="copyJsonOutput()" class="text-[11px] text-teal-400 hover:text-teal-300 cursor-pointer">
+                    کپی کردن JSON 📋
+                </button>
+            </div>
+            <pre id="json-output" class="p-4 bg-slate-950 border border-slate-800 rounded-2xl text-[11px] font-mono text-emerald-400 overflow-x-auto max-h-[380px] leading-relaxed">برای مشاهده خروجی، دکمه «ارسال درخواست» را بزنید.</pre>
+        </div>
+    </div>
+
+    <script>
+        async function fetchGraphAPI() {
+            const statusEl = document.getElementById('http-status');
+            const outputEl = document.getElementById('json-output');
+            const statsBox = document.getElementById('stats-box');
+            const nodeCountEl = document.getElementById('node-count');
+            const edgeCountEl = document.getElementById('edge-count');
+            const statusLabelEl = document.getElementById('status-label');
+
+            statusEl.innerText = 'در حال ارسال درخواست...';
+            outputEl.innerText = 'Connecting to get_dorm_graph.php...';
+
+            try {
+                const response = await fetch('get_dorm_graph.php');
+                statusEl.innerText = `HTTP ${response.status} ${response.statusText}`;
+                
+                const data = await response.json();
+                outputEl.innerText = JSON.stringify(data, null, 2);
+
+                if (data.data) {
+                    statsBox.classList.remove('hidden');
+                    nodeCountEl.innerText = (data.data.nodes || []).length;
+                    edgeCountEl.innerText = (data.data.edges || []).length;
+                    statusLabelEl.innerText = data.status || 'active';
+                }
+            } catch (err) {
+                statusEl.innerText = 'خطا در ارتباط با سرور';
+                outputEl.innerText = 'Error: ' + err.message;
+            }
+        }
+
+        function copyJsonOutput() {
+            const text = document.getElementById('json-output').innerText;
+            navigator.clipboard.writeText(text);
+            alert('متن JSON با موفقیت کپی شد!');
+        }
+    </script>
+</body>
+</html>

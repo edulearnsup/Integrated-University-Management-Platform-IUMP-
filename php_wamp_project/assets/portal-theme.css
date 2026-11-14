@@ -1,0 +1,144 @@
+/**
+ * تم‌های سراسری دارک و لایت + هویت بصری پردیس پسران نیشابور
+ * دانشگاه ملی مهارت واحد پسران نیشابور - سامانه یکپارچه صمد
+ */
+
+/* ===================== LIGHT THEME STYLES ===================== */
+body.theme-light {
+    background-color: #f8fafc !important;
+    color: #0f172a !important;
+}
+
+body.theme-light #mainSidebar,
+body.theme-light aside {
+    background-color: #ffffff !important;
+    border-color: #e2e8f0 !important;
+    color: #0f172a !important;
+}
+
+body.theme-light main {
+    background-color: #f8fafc !important;
+    color: #0f172a !important;
+}
+
+body.theme-light header {
+    background-color: #ffffff !important;
+    border-color: #e2e8f0 !important;
+    color: #0f172a !important;
+}
+
+body.theme-light .bg-\[\#0b0f19\],
+body.theme-light .bg-\[\#0f172a\],
+body.theme-light .bg-\[\#0f172a\]\/90,
+body.theme-light .bg-slate-950,
+body.theme-light .bg-slate-900 {
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+}
+
+body.theme-light .bg-\[\#1e293b\],
+body.theme-light .bg-\[\#1e293b\]\/70,
+body.theme-light .bg-\[\#1e293b\]\/95,
+body.theme-light .bg-slate-900\/80,
+body.theme-light .bg-slate-900\/70,
+body.theme-light .bg-slate-900\/60,
+body.theme-light .bg-slate-900\/50,
+body.theme-light .bg-slate-800 {
+    background-color: #f8fafc !important;
+    border-color: #e2e8f0 !important;
+    color: #1e293b !important;
+}
+
+body.theme-light .border-slate-800,
+body.theme-light .border-slate-700,
+body.theme-light .border-slate-800\/80 {
+    border-color: #e2e8f0 !important;
+}
+
+body.theme-light .text-white {
+    color: #0f172a !important;
+}
+
+body.theme-light .text-slate-300,
+body.theme-light .text-slate-200 {
+    color: #334155 !important;
+}
+
+body.theme-light .text-slate-400 {
+    color: #64748b !important;
+}
+
+body.theme-light input,
+body.theme-light select,
+body.theme-light textarea {
+    background-color: #ffffff !important;
+    color: #0f172a !important;
+    border-color: #cbd5e1 !important;
+}
+
+body.theme-light input::placeholder,
+body.theme-light textarea::placeholder {
+    color: #94a3b8 !important;
+}
+
+body.theme-light table th {
+    background-color: #f1f5f9 !important;
+    color: #334155 !important;
+    border-color: #e2e8f0 !important;
+}
+
+body.theme-light table td {
+    border-color: #f1f5f9 !important;
+    color: #1e293b !important;
+}
+
+body.theme-light tr:hover {
+    background-color: #f8fafc !important;
+}
+
+body.theme-light .tab-pane {
+    color: #0f172a !important;
+}
+
+body.theme-light .tab-nav-btn.text-slate-400 {
+    color: #475569 !important;
+}
+
+body.theme-light .tab-nav-btn.text-slate-400:hover {
+    background-color: #e2e8f0 !important;
+    color: #0f172a !important;
+}
+
+body.theme-light .bg-slate-950\/70,
+body.theme-light .bg-slate-950\/80 {
+    background-color: #f1f5f9 !important;
+    border-color: #cbd5e1 !important;
+}
+
+/* ===================== NISHAPUR GEOMETRIC PATTERNS ===================== */
+.nishapur-shamseh-bg {
+    background-image: radial-gradient(#0d9488 0.75px, transparent 0.75px), radial-gradient(#0284c7 0.75px, #0b0f19 0.75px);
+    background-size: 30px 30px;
+    background-position: 0 0, 15px 15px;
+}
+
+body.theme-light .nishapur-shamseh-bg {
+    background-image: radial-gradient(#0d9488 0.75px, transparent 0.75px), radial-gradient(#0284c7 0.75px, #f8fafc 0.75px);
+    background-size: 30px 30px;
+    background-position: 0 0, 15px 15px;
+}
+
+.nishapur-turquoise-glow {
+    box-shadow: 0 0 25px rgba(13, 148, 136, 0.25);
+}
+
+/* Print Cleanliness */
+@media print {
+    body {
+        background: white !important;
+        color: black !important;
+    }
+    .no-print {
+        display: none !important;
+    }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "samad-portal-tailwind",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local Tailwind CSS v4 CLI build setup for Samad PHP Portal",
+  "scripts": {
+    "build": "npx @tailwindcss/cli -i ./input.css -o ./tailwind.css --minify",
+    "watch": "npx @tailwindcss/cli -i ./input.css -o ./tailwind.css --watch"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.1.0",
+    "tailwindcss": "^4.1.0"
+  }
+}

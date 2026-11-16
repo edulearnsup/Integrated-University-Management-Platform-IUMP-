@@ -166,6 +166,7 @@ try {
 
     // ایجاد نشست کاربر و صدور توکن JWT
     $_SESSION['student_id'] = $student_id;
+    $_SESSION['national_id'] = $national_id;
     $_SESSION['student_name'] = $full_name;
     $_SESSION['campus'] = $campus;
 

@@ -14,8 +14,44 @@ session_start();
 require_once 'db.php';
 require_once 'jwt_auth.php';
 
-$jwtAuth = samad_require_page_jwt($pdo, ['student'], 'dorm:room:view_self');
+$jwtAuth = samad_require_page_jwt($pdo, ['student'], null);
+
+if (($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_exit_impersonation'])) || isset($_GET['exit_impersonation'])) {
+    if (!empty($jwtAuth['is_impersonating'])) {
+        samad_stop_student_impersonation($pdo, true);
+        header('Location: manager_panel.php?tab=students');
+        exit;
+    }
+}
+
 $student_id = (string)$jwtAuth['sub'];
+$isImpersonating = !empty($jwtAuth['is_impersonating']);
+$impersonatorInfo = is_array($jwtAuth['impersonator'] ?? null) ? $jwtAuth['impersonator'] : [];
+$canCard = samad_has_permission($jwtAuth, 'dorm:card:view_self');
+$canDormRoom = samad_has_permission($jwtAuth, 'dorm:room:view_self');
+$canDormGraph = samad_has_permission($jwtAuth, 'dorm:graph:view_self');
+$canGuestRequest = samad_has_permission($jwtAuth, 'dorm:guest_request:submit');
+$canFestivals = samad_has_permission($jwtAuth, 'student:festivals:view');
+$canSkillsGraphView = samad_has_permission($jwtAuth, 'skills:graph:view_self');
+$canSkillsGraphManage = samad_has_permission($jwtAuth, 'skills:graph:manage_self');
+$canWelfare = samad_has_permission($jwtAuth, 'welfare:book');
+$canProfileEdit = samad_has_permission($jwtAuth, 'student:profile:edit');
+
+$allowedStudentTabs = [];
+if ($canCard) $allowedStudentTabs[] = 'card';
+if ($canDormRoom || $canDormGraph || $canGuestRequest) $allowedStudentTabs[] = 'dorm';
+if ($canFestivals || $canSkillsGraphView) $allowedStudentTabs[] = 'festivals';
+if ($canWelfare) $allowedStudentTabs[] = 'welfare';
+
+if (empty($allowedStudentTabs) && !$canProfileEdit) {
+    samad_render_forbidden_page(
+        'دسترسی به میزکار غیرفعال است',
+        'تمامی قابلیت‌های میزکار دانشجویی شما توسط مدیریت دانشگاه غیرفعال شده است.',
+        (string)($jwtAuth['role'] ?? 'student')
+    );
+}
+$defaultStudentTab = $allowedStudentTabs[0] ?? '';
+
 $msg = '';
 $err = '';
 
@@ -25,6 +61,11 @@ $stmt->execute([$student_id]);
 $student = $stmt->fetch();
 
 if (!$student) {
+    if ($isImpersonating) {
+        samad_stop_student_impersonation($pdo, false);
+        header('Location: manager_panel.php?tab=students');
+        exit;
+    }
     session_destroy();
     header('Location: login.php');
     exit;
@@ -55,29 +96,156 @@ $months_fa = ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'م�
 $today_parts = explode('-', date('Y-m-d'));
 list($jy, $jm, $jd) = gregorian_to_jalali(intval($today_parts[0]), intval($today_parts[1]), intval($today_parts[2]));
 $current_persian_date = "{$jd} " . ($months_fa[$jm - 1] ?? '') . " {$jy}";
+$current_jalali_short = sprintf('%04d/%02d/%02d', $jy, $jm, $jd);
 
-// ویرایش مشخصات تماس و رمز عبور
+// کنترل محدودیت چاپ مدارک و بلیت‌ها (AJAX JSON)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_student_print_check'])) {
+    $printAction = trim((string)($_POST['print_action'] ?? ''));
+    $printPermMap = [
+        'dorm:card:print' => 'dorm:card:view_self',
+        'dorm:certificate:print' => 'dorm:room:view_self',
+        'welfare:gym_ticket:print' => 'welfare:book',
+    ];
+    if (!isset($printPermMap[$printAction])) {
+        samad_send_api_json(400, ['allowed' => false, 'errorCode' => 'INVALID_PRINT_ACTION', 'message' => 'نوع عملیات چاپ نامعتبر است.']);
+    }
+    $reqPerm = $printPermMap[$printAction];
+    if (!samad_has_permission($jwtAuth, $reqPerm)) {
+        samad_log_auth_event($pdo, 'access_denied_403', $student_id, 'student', $jwtAuth['jti'] ?? null, 'dashboard.php', 403, "مجوز {$reqPerm} برای چاپ غیرفعال است");
+        samad_send_api_json(403, ['allowed' => false, 'errorCode' => 'FORBIDDEN_PERMISSION', 'message' => 'مجوز چاپ این بخش برای حساب شما غیرفعال است (403).']);
+    }
+    $limRes = samad_check_student_rate_limit($pdo, $student_id, $printAction);
+    if (!$limRes['allowed']) {
+        samad_log_rate_limit_exceeded($pdo, $student_id, $jwtAuth['jti'] ?? null, 'dashboard.php?print=' . $printAction, $limRes);
+        samad_send_api_json(429, ['allowed' => false, 'errorCode' => 'RATE_LIMIT_EXCEEDED', 'message' => $limRes['message'], 'rateLimit' => $limRes]);
+    }
+    samad_record_student_action($pdo, $student_id, $printAction, 'چاپ مدرک یا بلیت');
+    $updatedQuota = samad_check_student_rate_limit($pdo, $student_id, $printAction);
+    samad_send_api_json(200, ['allowed' => true, 'rateLimit' => $updatedQuota]);
+}
+
+// ثبت درخواست اقامت میهمان توسط دانشجو (حتی در صورت نداشتن تقاضای اولیه خوابگاه)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_submit_guest_request'])) {
+    if (!samad_has_permission($jwtAuth, 'dorm:guest_request:submit')) {
+        samad_log_auth_event($pdo, 'access_denied_403', $student_id, 'student', $jwtAuth['jti'], 'dashboard.php', 403, 'مجوز dorm:guest_request:submit غیرفعال است');
+        $err = 'مجوز ثبت درخواست اقامت میهمان برای حساب شما غیرفعال شده است (403).';
+    } else {
+        $guestLimit = samad_check_student_rate_limit($pdo, $student_id, 'dorm:guest_request:submit');
+        $reqDays = intval($_POST['requested_days'] ?? 7);
+        $probDesc = trim((string)($_POST['problem_description'] ?? ''));
+
+        if (!$guestLimit['allowed']) {
+            samad_log_rate_limit_exceeded($pdo, $student_id, $jwtAuth['jti'] ?? null, 'dashboard.php?action=submit_guest_request', $guestLimit);
+            $err = $guestLimit['message'];
+        } elseif ($reqDays < 1 || $reqDays > 90) {
+            $err = 'تعداد روز اقامت میهمان باید بین ۱ تا ۹۰ روز باشد.';
+        } elseif (mb_strlen($probDesc, 'UTF-8') < 10) {
+            $err = 'لطفاً شرح مشکل و دلیل درخواست اقامت میهمان را با جزئیات کافی (حداقل ۱۰ کاراکتر) وارد نمایید.';
+        } else {
+            try {
+                $stmtChkPend = $pdo->prepare("SELECT COUNT(*) FROM `guest_dorm_requests` WHERE `student_id` = ? AND `status` = 'pending'");
+                $stmtChkPend->execute([$student_id]);
+                if ((int)$stmtChkPend->fetchColumn() > 0) {
+                    $err = 'شما هم‌اکنون یک درخواست اقامت میهمان در حال بررسی دارید. تا تعیین تکلیف مدیر منتظر بمانید.';
+                } else {
+                    $wasApplicant = !empty($student['request_dormitory']) ? 1 : 0;
+                    $stmtChkAlloc = $pdo->prepare("SELECT COUNT(*) FROM `dorm_allocations` WHERE `student_id` = ? AND `is_active` = 1");
+                    $stmtChkAlloc->execute([$student_id]);
+                    $wasHoused = ((int)$stmtChkAlloc->fetchColumn() > 0) ? 1 : 0;
+
+                    $stmtInsGr = $pdo->prepare("
+                        INSERT INTO `guest_dorm_requests`
+                            (`student_id`, `full_name`, `national_id`, `mobile`, `field_of_study`, `study_shift`, `was_dorm_applicant`, `has_active_allocation`, `problem_description`, `requested_days`, `status`, `created_at`)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NOW())
+                    ");
+                    $stmtInsGr->execute([
+                        $student_id,
+                        (string)($student['full_name'] ?? ''),
+                        (string)($student['national_id'] ?? ''),
+                        (string)($student['mobile'] ?? ''),
+                        (string)($student['field_of_study'] ?? ''),
+                        (string)($student['study_shift'] ?? ''),
+                        $wasApplicant,
+                        $wasHoused,
+                        mb_substr($probDesc, 0, 2000, 'UTF-8'),
+                        $reqDays,
+                    ]);
+
+                    samad_record_student_action($pdo, $student_id, 'dorm:guest_request:submit', "درخواست اقامت میهمان {$reqDays} روزه");
+                    samad_log_auth_event(
+                        $pdo,
+                        'guest_request_submitted',
+                        $student_id,
+                        'student',
+                        $jwtAuth['jti'],
+                        'dashboard.php',
+                        200,
+                        "ثبت درخواست اقامت میهمان برای {$reqDays} روز" . ($wasApplicant ? '' : ' (غیرمتقاضی قبلی خوابگاه)')
+                    );
+                    $msg = 'درخواست اقامت میهمان شما با موفقیت ثبت شد و برای بررسی به کارتابل مدیریت ارسال گردید.';
+                }
+            } catch (Exception $e) {
+                $err = 'خطا در ثبت درخواست اقامت میهمان: ' . $e->getMessage();
+            }
+        }
+    }
+}
+
+// ویرایش مشخصات تماس و رمز عبور (با اعمال محدودیت مجزا برای تغییر شماره تلفن و تغییر کلمه عبور)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_profile'])) {
     if (!samad_has_permission($jwtAuth, 'student:profile:edit')) {
         samad_log_auth_event($pdo, 'access_denied_403', $student_id, 'student', $jwtAuth['jti'], 'dashboard.php', 403, 'مجوز student:profile:edit غیرفعال است');
         $err = 'مجوز ویرایش مشخصات فردی توسط مدیریت غیرفعال شده است (403).';
     } else {
+        $current_mobile = toEnglishDigits(trim((string)($student['mobile'] ?? '')));
         $new_mobile = toEnglishDigits(trim($_POST['mobile'] ?? ''));
         $new_pass   = trim($_POST['new_password'] ?? '');
 
-        if (!empty($new_mobile)) {
-            try {
-                if (!empty($new_pass)) {
-                    $hashed = password_hash($new_pass, PASSWORD_DEFAULT);
-                    $stmtUp = $pdo->prepare("UPDATE `students` SET `mobile` = ?, `password` = ? WHERE `student_id` = ?");
-                    $stmtUp->execute([$new_mobile, $hashed, $student_id]);
-                } else {
-                    $stmtUp = $pdo->prepare("UPDATE `students` SET `mobile` = ? WHERE `student_id` = ?");
-                    $stmtUp->execute([$new_mobile, $student_id]);
+        $mobileChanged = ($new_mobile !== '' && $new_mobile !== $current_mobile);
+        $passwordChanged = ($new_pass !== '');
+
+        if (empty($new_mobile)) {
+            $err = 'شماره تلفن همراه نمی‌تواند خالی باشد.';
+        } elseif (!$mobileChanged && !$passwordChanged) {
+            $err = 'تغییری در شماره تلفن همراه یا کلمه عبور اعمال نشده است.';
+        } else {
+            if ($mobileChanged) {
+                $mobLim = samad_check_student_rate_limit($pdo, $student_id, 'student:profile:change_mobile');
+                if (!$mobLim['allowed']) {
+                    samad_log_rate_limit_exceeded($pdo, $student_id, $jwtAuth['jti'] ?? null, 'dashboard.php?action=change_mobile', $mobLim);
+                    $err = $mobLim['message'];
                 }
-                $msg = 'اطلاعات کاربری و شماره تماس شما با موفقیت در پایگاه‌داده ذخیره شد.';
-            } catch (Exception $e) {
-                $err = 'خطا در ذخیره‌سازی: ' . $e->getMessage();
+            }
+            if ($err === '' && $passwordChanged) {
+                $passLim = samad_check_student_rate_limit($pdo, $student_id, 'student:profile:change_password');
+                if (!$passLim['allowed']) {
+                    samad_log_rate_limit_exceeded($pdo, $student_id, $jwtAuth['jti'] ?? null, 'dashboard.php?action=change_password', $passLim);
+                    $err = $passLim['message'];
+                }
+            }
+
+            if ($err === '') {
+                try {
+                    if ($passwordChanged) {
+                        $hashed = password_hash($new_pass, PASSWORD_DEFAULT);
+                        $stmtUp = $pdo->prepare("UPDATE `students` SET `mobile` = ?, `password_hash` = ? WHERE `student_id` = ?");
+                        $stmtUp->execute([$new_mobile, $hashed, $student_id]);
+                    } else {
+                        $stmtUp = $pdo->prepare("UPDATE `students` SET `mobile` = ? WHERE `student_id` = ?");
+                        $stmtUp->execute([$new_mobile, $student_id]);
+                    }
+                    if ($mobileChanged) {
+                        samad_record_student_action($pdo, $student_id, 'student:profile:change_mobile', "تغییر شماره از {$current_mobile} به {$new_mobile}");
+                    }
+                    if ($passwordChanged) {
+                        samad_record_student_action($pdo, $student_id, 'student:profile:change_password', 'تغییر کلمه عبور دانشجو');
+                    }
+                    $stmt->execute([$student_id]);
+                    $student = $stmt->fetch() ?: $student;
+                    $msg = 'اطلاعات کاربری و مشخصات تماس شما با موفقیت در پایگاه‌داده ذخیره شد.';
+                } catch (Exception $e) {
+                    $err = 'خطا در ذخیره‌سازی: ' . $e->getMessage();
+                }
             }
         }
     }
@@ -89,11 +257,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_charge_wallet'
         samad_log_auth_event($pdo, 'access_denied_403', $student_id, 'student', $jwtAuth['jti'], 'dashboard.php', 403, 'مجوز welfare:book برای شارژ کیف پول غیرفعال است');
         $err = 'مجوز عملیات کیف پول و خدمات رفاهی برای نقش شما غیرفعال است (403).';
     } else {
+        $walletLim = samad_check_student_rate_limit($pdo, $student_id, 'welfare:wallet_charge');
         $amount = intval($_POST['charge_amount'] ?? 0);
-        if ($amount >= 10000 && $amount <= 50000000) {
+        if (!$walletLim['allowed']) {
+            samad_log_rate_limit_exceeded($pdo, $student_id, $jwtAuth['jti'] ?? null, 'dashboard.php?action=charge_wallet', $walletLim);
+            $err = $walletLim['message'];
+        } elseif ($amount >= 10000 && $amount <= 50000000) {
             try {
                 $stmtUpW = $pdo->prepare("UPDATE `students` SET `wallet_balance` = `wallet_balance` + ? WHERE `student_id` = ?");
                 $stmtUpW->execute([$amount, $student_id]);
+                samad_record_student_action($pdo, $student_id, 'welfare:wallet_charge', 'شارژ مبلغ ' . number_format($amount) . ' ریال');
+                $stmt->execute([$student_id]);
+                $student = $stmt->fetch() ?: $student;
                 $msg = 'کیف پول الکترونیک شما با موفقیت به مبلغ ' . number_format($amount) . ' ریال (' . number_format($amount / 10) . ' تومان) از طریق درگاه پرداخت شاپرک شارژ شد.';
             } catch (Exception $e) {
                 $err = 'خطا در افزایش موجودی: ' . $e->getMessage();
@@ -111,7 +286,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_book_gym_slot'
         $err = 'مجوز رزرو سالن ورزشی و خدمات رفاهی برای نقش دانشجو غیرفعال شده است (403).';
     } else {
         $slot_id = intval($_POST['slot_id'] ?? 0);
-        if ($slot_id > 0) {
+        $gymLim = samad_check_student_rate_limit($pdo, $student_id, 'welfare:book_gym');
+        if (!$gymLim['allowed']) {
+            samad_log_rate_limit_exceeded($pdo, $student_id, $jwtAuth['jti'] ?? null, 'dashboard.php?action=book_gym_slot', $gymLim);
+            $err = $gymLim['message'];
+        } elseif ($slot_id > 0) {
             try {
             $pdo->beginTransaction();
 
@@ -235,6 +414,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_book_gym_slot'
             ]);
 
             $pdo->commit();
+            samad_record_student_action($pdo, $student_id, 'welfare:book_gym', 'رزرو سانس کد ' . $trackingCode);
             $msg = "سانس سالن بدنسازی با موفقیت رزرو شد! کد رهگیری بلیت شما: {$trackingCode} (توکن دیجیتال صادر گردید).";
 
             // بازخوانی موجودی جدید کیف پول و مشخصات دانشجو
@@ -384,6 +564,16 @@ if ($dorm) {
     } catch (Exception $e) {}
 }
 
+// واکشی سوابق درخواست‌های اقامت میهمان این دانشجو
+$myGuestRequests = [];
+try {
+    $stmtMyGuest = $pdo->prepare("SELECT * FROM `guest_dorm_requests` WHERE `student_id` = ? ORDER BY `id` DESC");
+    $stmtMyGuest->execute([$student_id]);
+    $myGuestRequests = $stmtMyGuest->fetchAll(PDO::FETCH_ASSOC);
+} catch (\Throwable $e) {
+    $myGuestRequests = [];
+}
+
 // =============================================================
 // ۸. واکشی داده‌های خدمات رفاهی و سانس‌های سالن بدنسازی دانشجو
 // =============================================================
@@ -397,101 +587,35 @@ try {
     $welfareGym = null;
 }
 
-// در صورت نبود سرویس سالن بدنسازی، ایجاد پیش‌فرض
-if (!$welfareGym) {
-    try {
-        $pdo->exec("
-            INSERT INTO `welfare_services` (`title`, `category`, `location`, `hourly_rate_rials`, `slot_duration_hours`, `capacity_per_slot`, `rules_guidelines`, `is_active`)
-            VALUES ('سالن بدنسازی و پرورش اندام پردیس', 'gym', 'زیرزمین خوابگاه مرکزی صمد - سالن شماره ۱', 50000, 2, 20, 'استفاده صرفاً با لباس و کفش ورزشی تمیز الزامی است. حداکثر زمان مجاز رزرو ۸ ساعت در هفته می‌باشد.', 1)
-        ");
-        $stmtGym = $pdo->query("SELECT * FROM `welfare_services` WHERE `category` = 'gym' OR `id` = 1 LIMIT 1");
-        $welfareGym = $stmtGym->fetch();
-    } catch (Exception $e) {}
-}
-
-// در صورت نبود سانس برای روزهای جاری و آینده، ایجاد خودکار سانس‌های ۷ روز پیش‌رو
-try {
-    $checkSlotsCount = (int)$pdo->query("SELECT COUNT(*) FROM `welfare_service_slots` WHERE `slot_date_gregorian` >= CURDATE()")->fetchColumn();
-    if ($checkSlotsCount === 0 && $welfareGym) {
-        $dayNamesFa = [
-            'Saturday'  => 'شنبه',
-            'Sunday'    => 'یک‌شنبه',
-            'Monday'    => 'دوشنبه',
-            'Tuesday'   => 'سه‌شنبه',
-            'Wednesday' => 'چهارشنبه',
-            'Thursday'  => 'پنج‌شنبه',
-            'Friday'    => 'جمعه'
-        ];
-
-        $timeBlocks = [
-            ['start' => '08:00:00', 'end' => '10:00:00', 'blocked' => 0, 'reason' => null],
-            ['start' => '10:00:00', 'end' => '12:00:00', 'blocked' => 0, 'reason' => null],
-            ['start' => '12:00:00', 'end' => '14:00:00', 'blocked' => 1, 'reason' => 'زمان ناهار، استراحت و نظافت سالن'],
-            ['start' => '14:00:00', 'end' => '16:00:00', 'blocked' => 0, 'reason' => null],
-            ['start' => '16:00:00', 'end' => '18:00:00', 'blocked' => 0, 'reason' => null],
-            ['start' => '18:00:00', 'end' => '20:00:00', 'blocked' => 0, 'reason' => null],
-            ['start' => '20:00:00', 'end' => '22:00:00', 'blocked' => 0, 'reason' => null]
-        ];
-
-        for ($i = 0; $i < 7; $i++) {
-            $ts = strtotime("+{$i} days");
-            $gDate = date('Y-m-d', $ts);
-            $dayEn = date('l', $ts);
-            $dayFa = $dayNamesFa[$dayEn] ?? $dayEn;
-
-            list($jYear, $jMonth, $jDay) = gregorian_to_jalali(intval(date('Y', $ts)), intval(date('n', $ts)), intval(date('j', $ts)));
-            $jDateStr = sprintf('%04d/%02d/%02d', $jYear, $jMonth, $jDay);
-
-            foreach ($timeBlocks as $block) {
-                $stmtInsSlot = $pdo->prepare("
-                    INSERT INTO `welfare_service_slots`
-                        (`service_id`, `slot_date_jalali`, `slot_date_gregorian`, `day_name_fa`, `start_time`, `end_time`, `duration_hours`, `total_capacity`, `booked_count`, `is_blocked`, `block_reason`)
-                    VALUES 
-                        (?, ?, ?, ?, ?, ?, 2, ?, 0, ?, ?)
-                ");
-                $stmtInsSlot->execute([
-                    $welfareGym['id'],
-                    $jDateStr,
-                    $gDate,
-                    $dayFa,
-                    $block['start'],
-                    $block['end'],
-                    $welfareGym['capacity_per_slot'] ?? 20,
-                    $block['blocked'],
-                    $block['reason']
-                ]);
-            }
-        }
-    }
-} catch (Exception $e) {}
-
-// واکشی سانس‌های ورزشی از امروز تا پایان روزهای آینده
+// واکشی سانس‌های ورزشی از امروز تا پایان روزهای آینده (بدون ایجاد داده تستی خودکار)
 $gymSlots = [];
 $gymSlotsByDate = [];
-try {
-    $stmtSlots = $pdo->prepare("
-        SELECT * FROM `welfare_service_slots`
-        WHERE `service_id` = ? AND `slot_date_gregorian` >= CURDATE()
-        ORDER BY `slot_date_gregorian` ASC, `start_time` ASC
-    ");
-    $stmtSlots->execute([$welfareGym['id'] ?? 1]);
-    $gymSlots = $stmtSlots->fetchAll();
+if ($welfareGym) {
+    try {
+        $stmtSlots = $pdo->prepare("
+            SELECT * FROM `welfare_service_slots`
+            WHERE `service_id` = ? AND `slot_date_gregorian` >= CURDATE()
+            ORDER BY `slot_date_gregorian` ASC, `start_time` ASC
+        ");
+        $stmtSlots->execute([$welfareGym['id']]);
+        $gymSlots = $stmtSlots->fetchAll();
 
-    foreach ($gymSlots as $s) {
-        $key = $s['slot_date_jalali'];
-        if (!isset($gymSlotsByDate[$key])) {
-            $gymSlotsByDate[$key] = [
-                'jalali' => $s['slot_date_jalali'],
-                'gregorian' => $s['slot_date_gregorian'],
-                'day_fa' => $s['day_name_fa'],
-                'slots' => []
-            ];
+        foreach ($gymSlots as $s) {
+            $key = $s['slot_date_jalali'];
+            if (!isset($gymSlotsByDate[$key])) {
+                $gymSlotsByDate[$key] = [
+                    'jalali' => $s['slot_date_jalali'],
+                    'gregorian' => $s['slot_date_gregorian'],
+                    'day_fa' => $s['day_name_fa'],
+                    'slots' => []
+                ];
+            }
+            $gymSlotsByDate[$key]['slots'][] = $s;
         }
-        $gymSlotsByDate[$key]['slots'][] = $s;
+    } catch (Exception $e) {
+        $gymSlots = [];
+        $gymSlotsByDate = [];
     }
-} catch (Exception $e) {
-    $gymSlots = [];
-    $gymSlotsByDate = [];
 }
 
 // واکشی سوابق رزروهای دانشجو با فیلدهای هماهنگ
@@ -552,6 +676,16 @@ try {
     $stmtTodayC->execute([$student_id]);
     $myTodayBookingsCount = (int)$stmtTodayC->fetchColumn();
 } catch (Exception $e) {}
+
+// واکشی سهمیه و محدودیت‌های فعلی تمام اکشن‌های دانشجو برای نمایش در پنل
+$studentQuotas = samad_get_all_student_action_quotas($pdo, $student_id);
+$qFmt = static function (array $quotas, string $key): string {
+    $q = $quotas[$key] ?? null;
+    if (!$q || empty($q['is_limit_enabled'])) {
+        return 'نامحدود';
+    }
+    return number_format((int)$q['remaining']) . ' از ' . number_format((int)$q['max_count']) . ' باقی‌مانده (' . number_format((int)$q['window_days']) . ' روزه)';
+};
 ?>
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -668,25 +802,37 @@ try {
 </head>
 <body class="bg-slate-100 min-h-screen py-6 px-4 text-slate-800 selection:bg-indigo-600 selection:text-white">
 
-    <!-- نوار میانبر تعاملی برای سوئیچ سریع بین سیستم‌ها (جهت سهولت کاربری و تست) -->
+    <?php if ($isImpersonating): ?>
+    <!-- نوار بازگشت سریع مدیر کل (با حفظ نشست مدیر و ثبت لاگ امنیتی) -->
+    <div class="sticky top-2 z-40 max-w-6xl mx-auto mb-4 bg-amber-950/95 backdrop-blur-md text-amber-50 px-4 py-3 rounded-2xl border border-amber-500/50 flex flex-wrap items-center justify-between gap-3 text-xs shadow-xl no-print">
+        <div class="flex flex-wrap items-center gap-2.5">
+            <span class="px-2.5 py-1 rounded-lg bg-amber-500 text-slate-950 font-black whitespace-nowrap shrink-0">حالت مشاهده مدیر</span>
+            <span>
+                نشست مدیر <strong class="text-white"><?= htmlspecialchars($impersonatorInfo['name'] ?? 'مدیر کل') ?></strong> فعال است
+                · در حال مشاهده پنل دانشجو <strong class="text-amber-300"><?= htmlspecialchars($student['full_name']) ?></strong>
+                (<span class="font-mono tabular-nums"><?= htmlspecialchars($student['student_id']) ?></span>)
+            </span>
+        </div>
+        <form method="POST" class="shrink-0">
+            <input type="hidden" name="action_exit_impersonation" value="1">
+            <button type="submit" class="px-4 py-2 bg-white hover:bg-amber-100 text-slate-950 font-black rounded-xl shadow transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0">
+                <span>↩</span>
+                <span>بازگشت به پنل مدیر</span>
+            </button>
+        </form>
+    </div>
+    <?php endif; ?>
+
+    <!-- نوار بالای میزکار دانشجو -->
     <div class="max-w-6xl mx-auto mb-4 bg-slate-900 text-white px-4 py-2.5 rounded-2xl flex flex-wrap items-center justify-between gap-3 text-xs shadow-md no-print">
         <div class="flex items-center gap-2">
-            <span class="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+            <span class="w-2.5 h-2.5 rounded-full bg-emerald-400"></span>
             <span class="font-bold">سامانه یکپارچه صمد - دانشگاه ملی مهارت</span>
             <span class="text-slate-400">|</span>
-            <span class="text-indigo-300 font-mono"><?= htmlspecialchars($current_persian_date) ?></span>
+            <span class="text-indigo-300 font-mono tabular-nums"><?= htmlspecialchars($current_persian_date) ?></span>
         </div>
         <div class="flex items-center gap-2 flex-wrap">
-            <span class="text-[11px] text-slate-400">جابجایی بین نقش‌ها:</span>
-            <a href="manager_panel.php" class="px-2.5 py-1 bg-indigo-700 hover:bg-indigo-600 text-white rounded-lg font-bold transition-all flex items-center gap-1">
-                <span>🏛️</span>
-                <span>پنل مدیر کل</span>
-            </a>
-            <a href="supervisor_panel.php" class="px-2.5 py-1 bg-amber-700 hover:bg-amber-600 text-white rounded-lg font-bold transition-all flex items-center gap-1">
-                <span>🌙</span>
-                <span>پنل سرپرست شب</span>
-            </a>
-            <a href="index.php" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-all flex items-center gap-1">
+            <a href="index.php" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-all flex items-center gap-1 whitespace-nowrap shrink-0">
                 <span>🌐</span>
                 <span>صفحه اصلی پرتال</span>
             </a>
@@ -739,17 +885,27 @@ try {
                 <span class="px-2.5 py-1.5 bg-slate-100 text-slate-700 border border-slate-200 rounded-xl text-[11px] font-mono tabular-nums" title="توکن احراز هویت JWT فعال (HS256)">
                     JWT: <?= htmlspecialchars(substr($jwtAuth['jti'], 0, 8)) ?> · <?= htmlspecialchars(samad_format_remaining_ttl((int)$jwtAuth['exp'])) ?>
                 </span>
+                <?php if ($canDormGraph): ?>
                 <button type="button" onclick="openStudentDormGraph()" class="px-3.5 py-2 bg-gradient-to-r from-teal-700 to-indigo-700 hover:from-teal-600 hover:to-indigo-600 text-white text-xs font-bold rounded-xl shadow-sm transition-all cursor-pointer flex items-center gap-1.5">
                     <span>🗺️</span>
                     <span>گراف محل اقامت من</span>
                 </button>
+                <?php endif; ?>
+                <?php if ($canCard): ?>
                 <button type="button" onclick="openStudentCardModal()" class="px-3.5 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl shadow-sm transition-all cursor-pointer flex items-center gap-1.5">
                     <span>🪪</span>
                     <span>کارت دانشجویی</span>
                 </button>
+                <?php endif; ?>
+                <?php if ($canProfileEdit): ?>
                 <button type="button" onclick="openProfileModal()" class="px-3.5 py-2 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 border border-indigo-200 text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center gap-1.5">
                     <span>✏️</span>
                     <span>ویرایش تماس</span>
+                </button>
+                <?php endif; ?>
+                <button type="button" onclick="openMyQuotasModal()" class="px-3.5 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 text-xs font-bold rounded-xl transition-all cursor-pointer flex items-center gap-1.5">
+                    <span>⏱️</span>
+                    <span>سهمیه اکشن‌های من</span>
                 </button>
                 <a href="logout.php" class="px-3.5 py-2 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold rounded-xl border border-rose-200 transition-all">
                     خروج
@@ -757,31 +913,60 @@ try {
             </div>
         </div>
 
+        <!-- اعلان خطای لحظه‌ای محدودیت اکشن‌های کلاینت‌ساید (چاپ و عملیات) -->
+        <div id="clientRateLimitBanner" class="hidden p-4 bg-rose-50 border border-rose-300 text-rose-800 text-xs font-bold rounded-2xl items-center justify-between gap-3 no-print shadow-xs">
+            <span id="clientRateLimitBannerText"></span>
+            <button type="button" onclick="this.parentElement.classList.add('hidden');this.parentElement.classList.remove('flex');" class="text-rose-700 hover:text-rose-950 font-black cursor-pointer">✕</button>
+        </div>
+
         <!-- تب‌های تعاملی داشبورد دانشجو -->
+        <?php if (!empty($allowedStudentTabs)): ?>
         <div class="flex items-center gap-2 border-b border-slate-200 pb-2 overflow-x-auto no-print">
-            <button type="button" onclick="switchStudentTab('card')" id="tab-btn-card" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all bg-teal-700 text-white shadow-sm cursor-pointer shrink-0">
+            <?php if ($canCard): ?>
+            <button type="button" onclick="switchStudentTab('card')" id="tab-btn-card" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all <?= $defaultStudentTab === 'card' ? 'bg-teal-700 text-white shadow-sm' : 'bg-white text-slate-600 hover:text-slate-900 border border-slate-200' ?> cursor-pointer shrink-0">
                 <span>🪪</span>
                 <span>کارت دانشجویی هوشمند</span>
             </button>
-            <button type="button" onclick="switchStudentTab('dorm')" id="tab-btn-dorm" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all bg-white text-slate-600 hover:text-slate-900 border border-slate-200 cursor-pointer shrink-0">
+            <?php endif; ?>
+            <?php if ($canDormRoom || $canDormGraph || $canGuestRequest): ?>
+            <button type="button" onclick="switchStudentTab('dorm')" id="tab-btn-dorm" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all <?= $defaultStudentTab === 'dorm' ? 'bg-teal-700 text-white shadow-sm' : 'bg-white text-slate-600 hover:text-slate-900 border border-slate-200' ?> cursor-pointer shrink-0">
                 <span>🏠</span>
-                <span>پرونده اسکان، هم‌اتاقی‌ها و گراف</span>
+                <span><?= ($canDormRoom || $canDormGraph) ? 'پرونده اسکان و درخواست میهمان' : 'درخواست اقامت میهمان' ?></span>
             </button>
-            <button type="button" onclick="switchStudentTab('festivals')" id="tab-btn-festivals" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all bg-white text-slate-600 hover:text-slate-900 border border-slate-200 cursor-pointer shrink-0">
+            <?php endif; ?>
+            <?php if ($canFestivals || $canSkillsGraphView): ?>
+            <button type="button" onclick="switchStudentTab('festivals')" id="tab-btn-festivals" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all <?= $defaultStudentTab === 'festivals' ? 'bg-teal-700 text-white shadow-sm' : 'bg-white text-slate-600 hover:text-slate-900 border border-slate-200' ?> cursor-pointer shrink-0">
                 <span>🏆</span>
-                <span>مهارت‌ها، تیم‌های ورزشی و فراخوان‌ها (<?= count($myTargetedCalls) ?>)</span>
+                <?php if ($canFestivals && $canSkillsGraphView): ?>
+                    <span>مهارت‌ها، تیم‌های ورزشی و فراخوان‌ها (<?= count($myTargetedCalls) ?>)</span>
+                <?php elseif ($canFestivals): ?>
+                    <span>تیم‌های ورزشی و فراخوان‌ها (<?= count($myTargetedCalls) ?>)</span>
+                <?php else: ?>
+                    <span>نقشه گراف مهارت‌ها و علایق</span>
+                <?php endif; ?>
             </button>
-            <button type="button" onclick="switchStudentTab('welfare')" id="tab-btn-welfare" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all bg-white text-slate-600 hover:text-slate-900 border border-slate-200 cursor-pointer shrink-0">
+            <?php endif; ?>
+            <?php if ($canWelfare): ?>
+            <button type="button" onclick="switchStudentTab('welfare')" id="tab-btn-welfare" class="flex items-center gap-2 px-4 py-2.5 text-xs font-bold rounded-xl transition-all <?= $defaultStudentTab === 'welfare' ? 'bg-teal-700 text-white shadow-sm' : 'bg-white text-slate-600 hover:text-slate-900 border border-slate-200' ?> cursor-pointer shrink-0">
                 <span>🏋️</span>
                 <span>خدمات رفاهی و سالن بدنسازی</span>
                 <?php if (count($myGymBookings) > 0): ?>
                     <span class="px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800 text-[10px] font-bold"><?= count($myGymBookings) ?> بلیت</span>
                 <?php endif; ?>
             </button>
+            <?php endif; ?>
         </div>
+        <?php else: ?>
+        <div class="bg-white rounded-3xl border border-amber-200 p-8 text-center space-y-2 shadow-sm">
+            <div class="text-2xl">🔒</div>
+            <h3 class="text-sm font-bold text-slate-900">تب‌های پنل دانشجویی توسط مدیریت غیرفعال شده‌اند</h3>
+            <p class="text-xs text-slate-500">در حال حاضر تنها دسترسی مجاز شما از نوار بالا قابل مشاهده است.</p>
+        </div>
+        <?php endif; ?>
 
         <!-- ==================== TAB 1: SMART STUDENT ID CARD (کارت دانشجویی در صفحه اصلی) ==================== -->
-        <div id="tab-content-card" class="space-y-6">
+        <?php if ($canCard): ?>
+        <div id="tab-content-card" class="<?= $defaultStudentTab === 'card' ? '' : 'hidden ' ?>space-y-6">
             <!-- کارت هوشمند دانشجویی پردیس پسران نیشابور -->
             <div class="bg-white rounded-3xl border border-slate-200/90 p-6 sm:p-8 shadow-sm space-y-6">
                 <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 border-b border-slate-200 pb-4 no-print">
@@ -829,7 +1014,7 @@ try {
                                 <?php if (!empty($student['photo_path']) && file_exists(__DIR__ . '/' . $student['photo_path'])): ?>
                                     <img src="<?= htmlspecialchars($student['photo_path']) ?>" class="w-full h-full object-cover">
                                 <?php else: ?>
-                                    <img src="assets/images/student_sample_avatar_1790759772433.jpg" class="w-full h-full object-cover">
+                                    <div class="w-full h-full flex items-center justify-center bg-slate-800 text-slate-300 text-3xl">🎓</div>
                                 <?php endif; ?>
                             </div>
                             <span class="px-2 py-0.5 rounded-full bg-teal-500/20 text-teal-300 border border-teal-500/30 text-[9px] font-bold">
@@ -900,9 +1085,11 @@ try {
                 </div>
             </div>
         </div>
+        <?php endif; ?>
 
         <!-- ==================== TAB 2: DORM & ROOMMATES (خوابگاه و هم‌اتاقی‌ها) ==================== -->
-        <div id="tab-content-dorm" class="hidden space-y-6">
+        <?php if ($canDormRoom || $canDormGraph || $canGuestRequest): ?>
+        <div id="tab-content-dorm" class="<?= $defaultStudentTab === 'dorm' ? '' : 'hidden ' ?>space-y-6">
             <div class="bg-white rounded-3xl border border-slate-200 p-6 space-y-6 shadow-sm">
                 <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b pb-4">
                     <div>
@@ -918,20 +1105,24 @@ try {
                     </div>
                     <div class="flex items-center gap-2 flex-wrap">
                         <?php if ($dorm): ?>
+                            <?php if ($canDormGraph): ?>
                             <!-- دکمه باز کردن گراف در پنجره جدید -->
                             <a href="dorm_graph/index.html?mode=php&role=student" target="_blank" class="px-4 py-2 bg-gradient-to-r from-teal-700 to-indigo-700 hover:from-teal-600 hover:to-indigo-600 text-white text-xs font-bold rounded-xl shadow-sm transition-all flex items-center gap-2 cursor-pointer no-print">
                                 <span>🗺️</span>
                                 <span>باز کردن گراف در صفحه جدید ↗</span>
                             </a>
+                            <?php endif; ?>
+                            <?php if ($canDormRoom): ?>
                             <button type="button" onclick="openDormCertificateModal()" class="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold rounded-xl border border-slate-200 shadow-xs transition-all cursor-pointer flex items-center gap-1.5 no-print">
                                 <span>📜</span>
                                 <span>چاپ گواهی سکونت</span>
                             </button>
-                        <?php elseif ($student['request_dormitory']): ?>
+                            <?php endif; ?>
+                        <?php elseif ($canDormRoom && $student['request_dormitory']): ?>
                             <span class="px-3 py-1 bg-amber-50 text-amber-800 border border-amber-300 text-xs font-bold rounded-xl">
                                 در صف انتظار تخصیص
                             </span>
-                        <?php else: ?>
+                        <?php elseif ($canDormRoom): ?>
                             <span class="px-3 py-1 bg-slate-100 text-slate-600 text-xs font-bold rounded-xl">
                                 فاقد تقاضای خوابگاه
                             </span>
@@ -940,6 +1131,7 @@ try {
                 </div>
 
                 <!-- نمای کارتی هم‌اتاقی‌ها و پرونده اسکان -->
+                <?php if ($canDormRoom): ?>
                 <div id="dorm-subview-cards" class="space-y-6">
                     <?php if ($dorm): ?>
                         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
@@ -1104,8 +1296,146 @@ try {
                     </div>
                 <?php endif; ?>
                 </div>
+                <?php endif; ?>
+
+                <!-- بخش درخواست اقامت میهمان توسط دانشجو (حتی بدون تقاضای قبلی خوابگاه) -->
+                <?php if ($canGuestRequest): ?>
+                <div id="dorm-guest-request-section" class="pt-5 border-t border-slate-200 space-y-5 no-print">
+                    <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div>
+                            <h4 class="text-sm font-bold text-slate-900 flex items-center gap-2">
+                                <span>🛏️</span>
+                                <span>ثبت درخواست اقامت میهمان در خوابگاه صمد</span>
+                            </h4>
+                            <p class="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                                حتی اگر در هنگام ثبت‌نام متقاضی خوابگاه نبوده‌اید یا در صف اسکان نیستید، در شرایط ضروری می‌توانید با شرح مشکل خود درخواست اقامت موقت (میهمان) ثبت نمایید.
+                            </p>
+                        </div>
+                        <?php if (empty($student['request_dormitory']) && !$dorm): ?>
+                            <span class="px-3 py-1.5 bg-amber-50 text-amber-800 border border-amber-300 rounded-xl text-[11px] font-bold whitespace-nowrap shrink-0">
+                                غیرمتقاضی قبلی خوابگاه · ثبت موقت میهمان
+                            </span>
+                        <?php endif; ?>
+                    </div>
+
+                    <form method="POST" class="p-5 bg-slate-50 border border-slate-200 rounded-2xl space-y-4 text-xs">
+                        <input type="hidden" name="action_submit_guest_request" value="1">
+                        <div class="grid grid-cols-1 md:grid-cols-4 gap-4">
+                            <div>
+                                <label class="block text-slate-700 font-bold mb-1.5">مدت اقامت درخواستی (روز) <span class="text-rose-500">*</span></label>
+                                <input type="number" name="requested_days" min="1" max="90" value="7" required
+                                    class="w-full px-3 py-2.5 bg-white border border-slate-300 rounded-xl font-mono tabular-nums text-center font-bold focus:ring-2 focus:ring-teal-500">
+                            </div>
+                            <div class="md:col-span-3">
+                                <label class="block text-slate-700 font-bold mb-1.5">شرح دقیق مشکل و علت درخواست اقامت میهمان <span class="text-rose-500">*</span></label>
+                                <textarea name="problem_description" rows="2" required minlength="10"
+                                    placeholder="شرح مشکل، شرایط اسکان یا علت نیاز به اقامت موقت را بنویسید..."
+                                    class="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-xl text-xs focus:ring-2 focus:ring-teal-500"></textarea>
+                            </div>
+                        </div>
+                        <div class="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-200">
+                            <div class="space-y-0.5">
+                                <span class="text-[11px] text-slate-500 block">
+                                    این درخواست توسط سرپرست قابل مشاهده بوده و تایید نهایی همراه با تخصیص اتاق توسط مدیر کل انجام می‌شود.
+                                </span>
+                                <?php $qGuest = $studentQuotas['dorm:guest_request:submit'] ?? null; ?>
+                                <span class="text-[11px] font-bold <?= ($qGuest && $qGuest['is_limit_enabled'] && !$qGuest['allowed']) ? 'text-rose-600' : 'text-teal-700' ?> block font-mono tabular-nums">
+                                    سهمیه ثبت درخواست میهمان: <?= htmlspecialchars($qFmt($studentQuotas, 'dorm:guest_request:submit')) ?>
+                                </span>
+                            </div>
+                            <button type="submit" <?= ($qGuest && $qGuest['is_limit_enabled'] && !$qGuest['allowed']) ? 'disabled' : '' ?> class="px-5 py-2.5 bg-teal-700 hover:bg-teal-600 disabled:bg-slate-300 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-bold rounded-xl shadow-xs transition-all cursor-pointer whitespace-nowrap shrink-0">
+                                <?= ($qGuest && $qGuest['is_limit_enabled'] && !$qGuest['allowed']) ? 'سقف ثبت درخواست تکمیل شده است' : 'ثبت درخواست اقامت میهمان' ?>
+                            </button>
+                        </div>
+                    </form>
+
+                    <?php if (!empty($myGuestRequests)): ?>
+                        <div class="space-y-2.5">
+                            <div class="flex items-center justify-between">
+                                <h5 class="text-xs font-bold text-slate-800">سوابق درخواست‌های اقامت میهمان شما</h5>
+                                <span class="text-[11px] text-slate-500 font-mono tabular-nums"><?= count($myGuestRequests) ?> مورد</span>
+                            </div>
+                            <div class="overflow-x-auto border border-slate-200 rounded-2xl">
+                                <table class="w-full text-right text-xs">
+                                    <thead class="bg-slate-50 text-slate-600 border-b border-slate-200">
+                                        <tr>
+                                            <th class="p-3">شماره · تاریخ</th>
+                                            <th class="p-3">نوع سابقه متقاضی</th>
+                                            <th class="p-3">مدت درخواستی</th>
+                                            <th class="p-3">شرح مشکل</th>
+                                            <th class="p-3">نتیجه بررسی مدیر</th>
+                                            <th class="p-3">وضعیت</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody class="divide-y divide-slate-100 bg-white">
+                                        <?php foreach ($myGuestRequests as $gReq): ?>
+                                            <?php
+                                                $gReqDateDisplay = trim((string)($gReq['submitted_jalali'] ?? ''));
+                                                if ($gReqDateDisplay === '' && !empty($gReq['created_at'])) {
+                                                    $gReqTs = strtotime((string)$gReq['created_at']);
+                                                    if ($gReqTs !== false) {
+                                                        list($gJy, $gJm, $gJd) = gregorian_to_jalali((int)date('Y', $gReqTs), (int)date('n', $gReqTs), (int)date('j', $gReqTs));
+                                                        $gReqDateDisplay = sprintf('%04d/%02d/%02d', $gJy, $gJm, $gJd);
+                                                    } else {
+                                                        $gReqDateDisplay = substr((string)$gReq['created_at'], 0, 10);
+                                                    }
+                                                }
+                                                if ($gReqDateDisplay === '') {
+                                                    $gReqDateDisplay = '-';
+                                                }
+                                            ?>
+                                            <tr>
+                                                <td class="p-3 font-mono tabular-nums text-slate-700">
+                                                    #<?= (int)$gReq['id'] ?> · <?= htmlspecialchars($gReqDateDisplay) ?>
+                                                </td>
+                                                <td class="p-3">
+                                                    <?php if (!empty($gReq['was_dorm_applicant'])): ?>
+                                                        <span class="text-slate-700 font-semibold">متقاضی قبلی خوابگاه</span>
+                                                    <?php else: ?>
+                                                        <span class="px-2 py-0.5 rounded bg-amber-50 text-amber-800 border border-amber-200 text-[11px] font-bold">غیرمتقاضی قبلی (موقت)</span>
+                                                    <?php endif; ?>
+                                                </td>
+                                                <td class="p-3 font-mono tabular-nums font-bold text-slate-800">
+                                                    <?= (int)$gReq['requested_days'] ?> روز
+                                                </td>
+                                                <td class="p-3 text-slate-700 max-w-xs leading-relaxed">
+                                                    <?= nl2br(htmlspecialchars($gReq['problem_description'])) ?>
+                                                </td>
+                                                <td class="p-3 text-slate-600 text-[11px]">
+                                                    <?php if ($gReq['status'] === 'approved'): ?>
+                                                        <div class="font-bold text-emerald-700">
+                                                            اتاق <?= htmlspecialchars($gReq['assigned_room_number'] ?? '-') ?> · <?= (int)($gReq['approved_days'] ?? $gReq['requested_days']) ?> روز
+                                                        </div>
+                                                        <?php if (!empty($gReq['manager_note'])): ?>
+                                                            <div class="text-slate-500 mt-0.5"><?= htmlspecialchars($gReq['manager_note']) ?></div>
+                                                        <?php endif; ?>
+                                                    <?php elseif ($gReq['status'] === 'rejected'): ?>
+                                                        <span class="text-rose-700"><?= htmlspecialchars($gReq['manager_note'] ?: 'توسط مدیر کل رد شد') ?></span>
+                                                    <?php else: ?>
+                                                        <span class="text-slate-400">در انتظار بررسی مدیر کل</span>
+                                                    <?php endif; ?>
+                                                </td>
+                                                <td class="p-3 whitespace-nowrap">
+                                                    <?php if ($gReq['status'] === 'approved'): ?>
+                                                        <span class="px-2.5 py-1 bg-emerald-100 text-emerald-800 rounded-lg font-bold text-[11px]">تایید شده</span>
+                                                    <?php elseif ($gReq['status'] === 'rejected'): ?>
+                                                        <span class="px-2.5 py-1 bg-rose-100 text-rose-800 rounded-lg font-bold text-[11px]">رد شده</span>
+                                                    <?php else: ?>
+                                                        <span class="px-2.5 py-1 bg-amber-100 text-amber-800 rounded-lg font-bold text-[11px]">در انتظار بررسی</span>
+                                                    <?php endif; ?>
+                                                </td>
+                                            </tr>
+                                        <?php endforeach; ?>
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
+                    <?php endif; ?>
+                </div>
+                <?php endif; ?>
 
                 <!-- بخش گراف تعاملی خوابگاه (ماژول React تعبیه‌شده در داشبورد دانشجو) -->
+                <?php if ($canDormGraph): ?>
                 <div id="dorm-embedded-graph-section" class="pt-4 border-t border-slate-200 space-y-3 no-print">
                     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                         <div>
@@ -1138,13 +1468,17 @@ try {
                         ></iframe>
                     </div>
                 </div>
+                <?php endif; ?>
             </div>
         </div>
+        <?php endif; ?>
 
         <!-- ==================== TAB 3: FESTIVALS & SKILLS (مهارت‌ها و جشنواره‌ها) ==================== -->
-        <div id="tab-content-festivals" class="hidden space-y-6">
+        <?php if ($canFestivals || $canSkillsGraphView): ?>
+        <div id="tab-content-festivals" class="<?= $defaultStudentTab === 'festivals' ? '' : 'hidden ' ?>space-y-6">
             <div class="bg-white rounded-3xl border border-slate-200 p-6 space-y-6 shadow-sm">
                 
+                <?php if ($canFestivals): ?>
                 <!-- تیم‌های ورزشی منتخب -->
                 <div>
                     <h3 class="text-xs font-bold text-emerald-800 flex items-center gap-1.5 mb-3">
@@ -1228,8 +1562,10 @@ try {
                         </div>
                     <?php endif; ?>
                 </div>
+                <?php endif; ?>
 
                 <!-- بخش گراف تعاملی مهارت‌ها، علایق و دستاوردهای دانشجو -->
+                <?php if ($canSkillsGraphView): ?>
                 <div id="skills-embedded-graph-section" class="pt-5 border-t border-slate-200 space-y-3 no-print">
                     <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
                         <div>
@@ -1262,12 +1598,15 @@ try {
                         ></iframe>
                     </div>
                 </div>
+                <?php endif; ?>
 
             </div>
         </div>
+        <?php endif; ?>
 
         <!-- ==================== TAB 4: WELFARE & GYM RESERVATIONS (خدمات رفاهی و سالن بدنسازی) ==================== -->
-        <div id="tab-content-welfare" class="hidden space-y-6">
+        <?php if ($canWelfare): ?>
+        <div id="tab-content-welfare" class="<?= $defaultStudentTab === 'welfare' ? '' : 'hidden ' ?>space-y-6">
 
             <!-- بنر سربرگ سالن بدنسازی و خدمات رفاهی -->
             <div class="bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 text-white rounded-3xl p-6 sm:p-8 shadow-xl border border-indigo-500/30 space-y-4 relative overflow-hidden">
@@ -1321,7 +1660,12 @@ try {
 
                         <!-- دکمه‌های شارژ فوری حساب -->
                         <div class="pt-2 border-t border-slate-800 space-y-2">
-                            <span class="text-[10px] text-slate-400 block font-bold">شارژ سریع آنلاین:</span>
+                            <div class="flex items-center justify-between gap-2">
+                                <span class="text-[10px] text-slate-400 font-bold">شارژ سریع آنلاین:</span>
+                                <span class="text-[10px] font-mono tabular-nums <?= (!empty($studentQuotas['welfare:wallet_charge']['is_limit_enabled']) && empty($studentQuotas['welfare:wallet_charge']['allowed'])) ? 'text-rose-400' : 'text-emerald-300' ?>">
+                                    سهمیه: <?= htmlspecialchars($qFmt($studentQuotas, 'welfare:wallet_charge')) ?>
+                                </span>
+                            </div>
                             <form method="POST" class="grid grid-cols-2 gap-1.5">
                                 <input type="hidden" name="action_charge_wallet" value="1">
                                 <button type="submit" name="charge_amount" value="50000" class="px-2 py-1.5 bg-slate-800 hover:bg-indigo-600 text-slate-200 hover:text-white rounded-lg text-[10px] font-bold transition-all cursor-pointer text-center">
@@ -1369,6 +1713,12 @@ try {
                             <div class="flex items-center justify-between">
                                 <span>رزرو امروز شما:</span>
                                 <strong class="font-mono <?= $myTodayBookingsCount >= 2 ? 'text-rose-400' : 'text-emerald-400' ?>"><?= $myTodayBookingsCount ?> از ۲ سانس مجاز</strong>
+                            </div>
+                            <div class="flex items-center justify-between">
+                                <span>سهمیه اکشن رزرو سانس:</span>
+                                <strong class="font-mono tabular-nums <?= (!empty($studentQuotas['welfare:book_gym']['is_limit_enabled']) && empty($studentQuotas['welfare:book_gym']['allowed'])) ? 'text-rose-400' : 'text-indigo-300' ?>">
+                                    <?= htmlspecialchars($qFmt($studentQuotas, 'welfare:book_gym')) ?>
+                                </strong>
                             </div>
                             <span class="text-[10px] text-slate-400 block leading-tight">
                                 مجاز به رزرو بیش از ۲ ساعت (سانس‌های متوالی) در صورت داشتن سهمیه.
@@ -1675,10 +2025,12 @@ try {
             </div>
 
         </div>
+        <?php endif; ?>
 
     </div>
 
     <!-- مودال کارت دانشجویی هوشمند جهت چاپ A4 -->
+    <?php if ($canCard): ?>
     <div id="studentCardModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 overflow-y-auto no-print">
         <div class="bg-white rounded-3xl max-w-lg w-full p-6 space-y-6 shadow-2xl">
             <div class="flex items-center justify-between border-b pb-3">
@@ -1735,8 +2087,10 @@ try {
             </div>
         </div>
     </div>
+    <?php endif; ?>
 
     <!-- مودال چاپ گواهی رسمی سکونت در خوابگاه (فرمت اداری A4 دانشگاه ملی مهارت) -->
+    <?php if ($canDormRoom): ?>
     <div id="dormCertificateModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 overflow-y-auto">
         <div class="bg-white rounded-3xl max-w-2xl w-full p-6 space-y-6 shadow-2xl">
             <div class="flex items-center justify-between border-b pb-3 no-print">
@@ -1790,8 +2144,8 @@ try {
                 <!-- امضا و مهر رسمی -->
                 <div class="pt-8 flex items-center justify-between border-t border-slate-200">
                     <div class="text-center space-y-1">
-                        <span class="text-xs font-bold text-slate-800">دکتر علیرضا حسینی</span>
-                        <p class="text-[11px] text-slate-500">مدیر کل امور دانشجویی و اسکان پردیس</p>
+                        <span class="text-xs font-bold text-slate-800">مدیر کل امور دانشجویی دانشگاه</span>
+                        <p class="text-[11px] text-slate-500">معاونت دانشجویی و اسکان پردیس</p>
                         <div class="w-24 h-12 border border-dashed border-emerald-400 rounded-lg flex items-center justify-center text-[10px] text-emerald-700 font-bold bg-emerald-50/50 mt-1">
                             مهر رسمی دانشگاه ✓
                         </div>
@@ -1806,8 +2160,8 @@ try {
                     </div>
 
                     <div class="text-center space-y-1">
-                        <span class="text-xs font-bold text-slate-800">مهندس کامران قنبری</span>
-                        <p class="text-[11px] text-slate-500">مسئول ارشد سرپرستی خوابگاه صمد</p>
+                        <span class="text-xs font-bold text-slate-800">مسئول سرپرستی خوابگاه صمد</span>
+                        <p class="text-[11px] text-slate-500">اداره امور خوابگاه‌ها</p>
                         <div class="w-24 h-12 border border-dashed border-indigo-400 rounded-lg flex items-center justify-center text-[10px] text-indigo-700 font-bold bg-indigo-50/50 mt-1">
                             امضای سرپرستی ✓
                         </div>
@@ -1826,8 +2180,10 @@ try {
             </div>
         </div>
     </div>
+    <?php endif; ?>
 
     <!-- مودال ویرایش اطلاعات تماس دانشجو -->
+    <?php if ($canProfileEdit): ?>
     <div id="profileModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 overflow-y-auto no-print">
         <div class="bg-white rounded-3xl max-w-md w-full p-6 space-y-5 shadow-2xl">
             <div class="flex items-center justify-between border-b pb-3">
@@ -1839,12 +2195,24 @@ try {
                 <input type="hidden" name="action_update_profile" value="1">
 
                 <div>
-                    <label class="block text-slate-700 font-bold mb-1">شماره تلفن همراه:</label>
+                    <div class="flex items-center justify-between gap-2 mb-1">
+                        <label class="text-slate-700 font-bold">شماره تلفن همراه:</label>
+                        <?php $qMob = $studentQuotas['student:profile:change_mobile'] ?? null; ?>
+                        <span class="text-[10px] font-mono tabular-nums <?= ($qMob && $qMob['is_limit_enabled'] && !$qMob['allowed']) ? 'text-rose-600 font-bold' : 'text-indigo-700 font-semibold' ?>">
+                            سهمیه تغییر شماره: <?= htmlspecialchars($qFmt($studentQuotas, 'student:profile:change_mobile')) ?>
+                        </span>
+                    </div>
                     <input type="text" name="mobile" value="<?= htmlspecialchars($student['mobile']) ?>" required class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 font-mono text-left focus:ring-2 focus:ring-indigo-500">
                 </div>
 
                 <div>
-                    <label class="block text-slate-700 font-bold mb-1">رمز عبور جدید (اختیاری):</label>
+                    <div class="flex items-center justify-between gap-2 mb-1">
+                        <label class="text-slate-700 font-bold">رمز عبور جدید (اختیاری):</label>
+                        <?php $qPass = $studentQuotas['student:profile:change_password'] ?? null; ?>
+                        <span class="text-[10px] font-mono tabular-nums <?= ($qPass && $qPass['is_limit_enabled'] && !$qPass['allowed']) ? 'text-rose-600 font-bold' : 'text-indigo-700 font-semibold' ?>">
+                            سهمیه تغییر رمز: <?= htmlspecialchars($qFmt($studentQuotas, 'student:profile:change_password')) ?>
+                        </span>
+                    </div>
                     <input type="password" name="new_password" placeholder="تنها در صورت تمایل به تغییر وارد کنید" class="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 focus:ring-2 focus:ring-indigo-500">
                 </div>
 
@@ -1859,8 +2227,69 @@ try {
             </form>
         </div>
     </div>
+    <?php endif; ?>
+
+    <!-- مودال مشاهده وضعیت محدودیت و سهمیه تمام اکشن‌های دانشجو -->
+    <div id="myQuotasModal" onclick="if(event.target === this) closeMyQuotasModal()" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/80 backdrop-blur-xs p-4 overflow-y-auto no-print">
+        <div class="bg-white rounded-3xl max-w-3xl w-full p-6 space-y-4 shadow-2xl my-8">
+            <div class="flex items-center justify-between border-b border-slate-200 pb-3">
+                <div>
+                    <h3 class="text-sm font-black text-slate-900">سهمیه و محدودیت اکشن‌های مجاز دانشجو</h3>
+                    <p class="text-[11px] text-slate-500 mt-0.5">تنظیم‌شده توسط مدیریت سامانه در بخش JWT و کنترل دسترسی</p>
+                </div>
+                <button type="button" onclick="closeMyQuotasModal()" class="text-slate-400 hover:text-slate-700 text-xl cursor-pointer">✕</button>
+            </div>
+            <div class="overflow-x-auto max-h-[65vh] border border-slate-200 rounded-2xl">
+                <table class="w-full text-right text-xs border-collapse">
+                    <thead class="bg-slate-50 text-slate-600 border-b border-slate-200 sticky top-0">
+                        <tr>
+                            <th class="p-3 font-bold">دسته</th>
+                            <th class="p-3 font-bold">عنوان اکشن</th>
+                            <th class="p-3 font-bold">مصرف فعلی</th>
+                            <th class="p-3 font-bold">سقف مجاز / بازه</th>
+                            <th class="p-3 font-bold">وضعیت</th>
+                        </tr>
+                    </thead>
+                    <tbody class="divide-y divide-slate-100 bg-white">
+                        <?php foreach ($studentQuotas as $qItem): ?>
+                            <tr class="hover:bg-slate-50/70">
+                                <td class="p-3 text-[11px] text-slate-500 whitespace-nowrap"><?= htmlspecialchars($qItem['category'] ?? '') ?></td>
+                                <td class="p-3">
+                                    <div class="font-bold text-slate-800"><?= htmlspecialchars($qItem['action_label']) ?></div>
+                                    <div class="text-[10px] font-mono text-slate-400"><?= htmlspecialchars($qItem['action_key']) ?></div>
+                                </td>
+                                <td class="p-3 font-mono tabular-nums font-bold text-slate-700"><?= number_format((int)$qItem['used']) ?> بار</td>
+                                <td class="p-3 font-mono tabular-nums text-slate-700">
+                                    <?php if (!empty($qItem['is_limit_enabled'])): ?>
+                                        <?= number_format((int)$qItem['max_count']) ?> بار در <?= number_format((int)$qItem['window_days']) ?> روز
+                                    <?php else: ?>
+                                        <span class="text-emerald-700 font-bold">بدون محدودیت</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td class="p-3 whitespace-nowrap">
+                                    <?php if (empty($qItem['is_limit_enabled'])): ?>
+                                        <span class="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold">نامحدود</span>
+                                    <?php elseif (!empty($qItem['allowed'])): ?>
+                                        <span class="px-2 py-0.5 rounded bg-indigo-50 text-indigo-700 border border-indigo-200 text-[11px] font-bold font-mono tabular-nums">
+                                            <?= number_format((int)$qItem['remaining']) ?> باقی‌مانده
+                                        </span>
+                                    <?php else: ?>
+                                        <span class="px-2 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200 text-[11px] font-bold">تکمیل سقف</span>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+            <div class="flex justify-end pt-2 border-t border-slate-200">
+                <button type="button" onclick="closeMyQuotasModal()" class="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold rounded-xl cursor-pointer">بستن</button>
+            </div>
+        </div>
+    </div>
 
     <!-- ===================== MODAL: PRINTABLE DIGITAL GYM E-TICKET (A4) ===================== -->
+    <?php if ($canWelfare): ?>
     <div id="gymTicketModal" onclick="if(event.target === this) closeGymTicketModal()" class="hidden fixed inset-0 z-50 items-center justify-center bg-black/80 backdrop-blur-xs p-4 overflow-y-auto">
         <div class="bg-white rounded-3xl max-w-2xl w-full p-6 space-y-6 shadow-2xl relative">
             <div class="flex items-center justify-between border-b pb-3 no-print">
@@ -1919,11 +2348,11 @@ try {
                 <!-- مشخصات دارنده بلیت و جزئیات سانس -->
                 <div class="grid grid-cols-3 gap-4 items-center bg-slate-50 p-4 rounded-xl border border-slate-200">
                     <div class="flex flex-col items-center gap-1.5">
-                        <div class="w-20 h-24 rounded-xl overflow-hidden border-2 border-slate-300 bg-slate-200">
+                        <div class="w-20 h-24 rounded-xl overflow-hidden border-2 border-slate-300 bg-slate-200 flex items-center justify-center">
                             <?php if (!empty($student['photo_path']) && file_exists(__DIR__ . '/' . $student['photo_path'])): ?>
                                 <img src="<?= htmlspecialchars($student['photo_path']) ?>" class="w-full h-full object-cover">
                             <?php else: ?>
-                                <img src="assets/images/student_sample_avatar_1790759772433.jpg" class="w-full h-full object-cover">
+                                <span class="text-3xl">🎓</span>
                             <?php endif; ?>
                         </div>
                         <span class="text-[9px] text-slate-500 font-mono"><?= htmlspecialchars($student['student_id']) ?></span>
@@ -2006,8 +2435,8 @@ try {
                     </div>
 
                     <div class="text-center space-y-1">
-                        <span class="text-xs font-bold text-slate-800">دکتر علیرضا حسینی</span>
-                        <p class="text-[10px] text-slate-500">مدیر کل امور دانشجویی و رفاهی</p>
+                        <span class="text-xs font-bold text-slate-800">مدیر کل امور دانشجویی و رفاهی</span>
+                        <p class="text-[10px] text-slate-500">معاونت دانشجویی دانشگاه</p>
                         <div class="w-24 h-10 border border-dashed border-indigo-400 rounded-lg flex items-center justify-center text-[10px] text-indigo-700 font-bold bg-indigo-50/50 mt-1">
                             مهر رسمی پردیس ✓
                         </div>
@@ -2027,8 +2456,10 @@ try {
             </div>
         </div>
     </div>
+    <?php endif; ?>
 
     <script>
+        const allowedStudentTabs = <?= json_encode($allowedStudentTabs) ?>;
         let walletBalance = <?= intval($student['wallet_balance'] ?? 0) ?>;
 
         function chargeWallet(amount) {
@@ -2098,7 +2529,11 @@ try {
         }
 
         function switchStudentTab(tab) {
-            ['card', 'dorm', 'festivals', 'welfare'].forEach(t => {
+            if (!allowedStudentTabs.includes(tab)) {
+                tab = allowedStudentTabs[0] || '';
+            }
+            if (!tab) return;
+            allowedStudentTabs.forEach(t => {
                 const pane = document.getElementById('tab-content-' + t);
                 const btn  = document.getElementById('tab-btn-' + t);
                 if (pane && btn) {
@@ -2254,10 +2689,47 @@ try {
             }
         }
 
+        function showClientRateLimitError(msg) {
+            const box = document.getElementById('clientRateLimitBanner');
+            const txt = document.getElementById('clientRateLimitBannerText');
+            if (box && txt) {
+                txt.textContent = '⚠️ ' + (msg || 'سقف مجاز انجام این عملیات تکمیل شده است.');
+                box.classList.remove('hidden');
+                box.classList.add('flex');
+                box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            }
+        }
+
+        async function checkStudentPrintLimit(printAction) {
+            try {
+                const fd = new FormData();
+                fd.append('action_student_print_check', '1');
+                fd.append('print_action', printAction);
+                const res = await fetch('dashboard.php', {
+                    method: 'POST',
+                    body: fd,
+                    credentials: 'same-origin'
+                });
+                const data = await res.json();
+                if (!res.ok || !data.allowed) {
+                    showClientRateLimitError(data.message || 'سقف مجاز چاپ این مدرک در بازه تنظیم‌شده تکمیل شده است.');
+                    return false;
+                }
+                return true;
+            } catch (e) {
+                return true;
+            }
+        }
+
         // تابع کنترل‌شده و ایمن چاپ رسمی بلیت در قطع A4
-        function printGymTicket() {
+        async function printGymTicket() {
             if (currentViewingBooking && (currentViewingBooking.status === 'cancelled_by_manager' || currentViewingBooking.refund_status === 'refunded_to_wallet')) {
-                alert('این بلیت توسط مدیریت لغو شده و مبلغ آن به کیف پول شما عودت داده شده است. امکان چاپ بلیت باطل شده وجود ندارد.');
+                showClientRateLimitError('این بلیت توسط مدیریت لغو شده و مبلغ آن به کیف پول شما عودت داده شده است. امکان چاپ بلیت باطل شده وجود ندارد.');
+                return;
+            }
+            const ok = await checkStudentPrintLimit('welfare:gym_ticket:print');
+            if (!ok) {
+                closeGymTicketModal();
                 return;
             }
             document.body.classList.remove('print-dorm-certificate-active', 'print-student-card-active');
@@ -2266,14 +2738,24 @@ try {
         }
 
         // تابع چاپ اختصاصی گواهی سکونت
-        function printDormCertificate() {
+        async function printDormCertificate() {
+            const ok = await checkStudentPrintLimit('dorm:certificate:print');
+            if (!ok) {
+                closeDormCertificateModal();
+                return;
+            }
             document.body.classList.remove('print-gym-ticket-active', 'print-student-card-active');
             document.body.classList.add('print-dorm-certificate-active');
             window.print();
         }
 
         // تابع چاپ اختصاصی کارت دانشجویی
-        function printStudentCard() {
+        async function printStudentCard() {
+            const ok = await checkStudentPrintLimit('dorm:card:print');
+            if (!ok) {
+                closeStudentCardModal();
+                return;
+            }
             document.body.classList.remove('print-gym-ticket-active', 'print-dorm-certificate-active');
             document.body.classList.add('print-student-card-active');
             window.print();
@@ -2299,35 +2781,61 @@ try {
         });
 
         function openStudentCardModal() {
-            document.getElementById('studentCardModal').classList.remove('hidden');
+            const el = document.getElementById('studentCardModal');
+            if (el) el.classList.remove('hidden');
         }
 
         function closeStudentCardModal() {
-            document.getElementById('studentCardModal').classList.add('hidden');
+            const el = document.getElementById('studentCardModal');
+            if (el) el.classList.add('hidden');
         }
 
         function openDormCertificateModal() {
-            document.getElementById('dormCertificateModal').classList.remove('hidden');
+            const el = document.getElementById('dormCertificateModal');
+            if (el) el.classList.remove('hidden');
         }
 
         function closeDormCertificateModal() {
-            document.getElementById('dormCertificateModal').classList.add('hidden');
+            const el = document.getElementById('dormCertificateModal');
+            if (el) el.classList.add('hidden');
         }
 
         function openProfileModal() {
-            document.getElementById('profileModal').classList.remove('hidden');
+            const el = document.getElementById('profileModal');
+            if (el) el.classList.remove('hidden');
         }
 
         function closeProfileModal() {
-            document.getElementById('profileModal').classList.add('hidden');
+            const el = document.getElementById('profileModal');
+            if (el) el.classList.add('hidden');
+        }
+
+        function openMyQuotasModal() {
+            const el = document.getElementById('myQuotasModal');
+            if (el) {
+                el.classList.remove('hidden');
+                el.classList.add('flex');
+                el.style.display = 'flex';
+            }
+        }
+
+        function closeMyQuotasModal() {
+            const el = document.getElementById('myQuotasModal');
+            if (el) {
+                el.classList.add('hidden');
+                el.classList.remove('flex');
+                el.style.display = 'none';
+            }
         }
 
         // بررسی پارامتر تب در بارگذاری صفحه
         document.addEventListener('DOMContentLoaded', () => {
             const urlParams = new URLSearchParams(window.location.search);
             const initialTab = urlParams.get('tab');
-            if (initialTab && ['card', 'dorm', 'festivals', 'welfare'].includes(initialTab)) {
+            if (initialTab && allowedStudentTabs.includes(initialTab)) {
                 switchStudentTab(initialTab);
+            } else if (allowedStudentTabs.length > 0) {
+                switchStudentTab(allowedStudentTabs[0]);
             }
         });
 
@@ -2337,6 +2845,7 @@ try {
                 closeDormCertificateModal();
                 closeProfileModal();
                 closeGymTicketModal();
+                closeMyQuotasModal();
             }
         });
     </script>

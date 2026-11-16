@@ -10,7 +10,34 @@ session_start();
 require_once 'db.php';
 require_once 'jwt_auth.php';
 
-$jwtAuth = samad_require_page_jwt($pdo, ['supervisor'], 'dorm:attendance:manage');
+$jwtAuth = samad_require_page_jwt($pdo, ['supervisor'], null);
+
+if (($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_exit_impersonation'])) || isset($_GET['exit_impersonation'])) {
+    if (!empty($jwtAuth['is_impersonating'])) {
+        samad_stop_supervisor_impersonation($pdo, true);
+        header('Location: manager_panel.php?tab=supervisors');
+        exit;
+    }
+}
+
+$isImpersonating = !empty($jwtAuth['is_impersonating']);
+$impersonatorInfo = is_array($jwtAuth['impersonator'] ?? null) ? $jwtAuth['impersonator'] : [];
+
+$supCanAttendance = samad_has_permission($jwtAuth, 'dorm:attendance:manage');
+$supCanCleanliness = samad_has_permission($jwtAuth, 'dorm:cleanliness:manage');
+$supCanFacilities = samad_has_permission($jwtAuth, 'dorm:facilities:view');
+$supCanMaintenanceReport = samad_has_permission($jwtAuth, 'dorm:maintenance:report');
+$supCanGuestRequests = samad_has_permission($jwtAuth, 'dorm:guest_request:view');
+
+$supAllowedTabs = [];
+if ($supCanAttendance) $supAllowedTabs[] = 'attendance';
+if ($supCanCleanliness) $supAllowedTabs[] = 'cleanliness';
+if ($supCanFacilities || $supCanMaintenanceReport) $supAllowedTabs[] = 'facilities';
+if ($supCanGuestRequests) $supAllowedTabs[] = 'guest_requests';
+
+if (empty($supAllowedTabs)) {
+    samad_render_forbidden_page('تمامی مجوزهای پنل سرپرست غیرفعال شده است', 'هیچ‌یک از مجوزهای نقش سرپرست شبانه در ماتریس RBAC فعال نیست.', 'supervisor');
+}
 
 // تابع تبدیل تاریخ میلادی به هجری شمسی در PHP
 function gregorian_to_jalali($gy, $gm, $gd) {
@@ -37,7 +64,8 @@ $months_fa = ['فروردین', 'اردیبهشت', 'خرداد', 'تیر', 'م�
 
 $msg = '';
 $err = '';
-$active_tab = $_GET['tab'] ?? 'attendance';
+$requestedTab = $_GET['tab'] ?? $supAllowedTabs[0];
+$active_tab = in_array($requestedTab, $supAllowedTabs, true) ? $requestedTab : $supAllowedTabs[0];
 $current_date = isset($_GET['date']) ? trim($_GET['date']) : date('Y-m-d');
 $selected_floor = isset($_GET['floor']) ? trim($_GET['floor']) : 'all';
 
@@ -55,8 +83,24 @@ $prev_date = date('Y-m-d', strtotime($current_date . ' -1 day'));
 $next_date = date('Y-m-d', strtotime($current_date . ' +1 day'));
 $today_date = date('Y-m-d');
 
-$supervisor_name = $jwtAuth['name'] ?: ($_SESSION['admin_name'] ?? 'مهندس کامران قنبری (سرپرست شبانه)');
-$supervisor_nid  = $jwtAuth['sub'] ?: ($_SESSION['admin_nid'] ?? '0099887766');
+$supervisor_name = (string)($jwtAuth['name'] ?: ($_SESSION['admin_name'] ?? 'سرپرست شیفت شب'));
+$supervisor_nid  = (string)($jwtAuth['sub'] ?: ($_SESSION['admin_national_id'] ?? ''));
+
+$supSelfRow = null;
+try {
+    $stmtSupSelf = $pdo->prepare("SELECT `id`, `full_name`, `national_id`, `shift_days`, `shift_hours` FROM `admins` WHERE `national_id` = ? AND `role` = 'supervisor' LIMIT 1");
+    $stmtSupSelf->execute([$supervisor_nid]);
+    $supSelfRow = $stmtSupSelf->fetch(PDO::FETCH_ASSOC) ?: null;
+} catch (Throwable $e) {
+    $supSelfRow = null;
+}
+if (!$supSelfRow && $isImpersonating) {
+    samad_stop_supervisor_impersonation($pdo, false);
+    header('Location: manager_panel.php?tab=supervisors');
+    exit;
+}
+$supervisor_shift_days = trim((string)($supSelfRow['shift_days'] ?? '')) ?: 'شنبه تا چهارشنبه';
+$supervisor_shift_hours = trim((string)($supSelfRow['shift_hours'] ?? '')) ?: '۲۲:۰۰ الی ۰۶:۰۰ (شیفت سرشماری شبانه)';
 
 // -----------------------------------------------------------------
 // ۱. پردازش ثبت سرشماری شبانه
@@ -171,7 +215,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_report_mainten
 
                 if ($rInfo) {
                     $reported_at = $persian_date_short . ' - ' . date('H:i');
-                    $sup_code = 'SUP-405-01';
+                    $sup_code = $supervisor_nid;
 
                     $insMaint = $pdo->prepare("
                         INSERT INTO `maintenance_reports`
@@ -261,6 +305,27 @@ $roomsWithFacilities = $pdo->query("
 
 // گزارش‌های خرابی و تعمیرات ثبت‌شده
 $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER BY `id` DESC LIMIT 30")->fetchAll();
+
+// ۴. درخواست‌های اقامت میهمان دانشجویان (فقط خواندنی برای سرپرست)
+$supGuestRequests = [];
+$supGuestPendingCount = 0;
+if ($supCanGuestRequests) {
+    try {
+        $supGuestRequests = $pdo->query("
+            SELECT gr.*, s.full_name, s.national_id, s.mobile, s.campus, s.field_of_study, s.study_shift
+            FROM `guest_dorm_requests` gr
+            JOIN `students` s ON gr.student_id = s.student_id
+            ORDER BY FIELD(gr.status, 'pending', 'approved', 'rejected'), gr.id DESC
+        ")->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($supGuestRequests as $sgr) {
+            if (($sgr['status'] ?? '') === 'pending') {
+                $supGuestPendingCount++;
+            }
+        }
+    } catch (Throwable $e) {
+        $supGuestRequests = [];
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -280,26 +345,39 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
     </style>
 </head>
 <body class="bg-slate-100 min-h-screen text-slate-800 pb-16">
-    <!-- نوار میانبر تعاملی برای سوئیچ سریع بین سیستم‌ها (جهت سهولت کاربری و تست) -->
+    <?php if ($isImpersonating): ?>
+    <!-- نوار بازگشت سریع مدیر کل (با حفظ نشست مدیر و ثبت لاگ امنیتی) -->
+    <div class="sticky top-2 z-40 max-w-7xl mx-auto mt-3 mb-2 px-4 sm:px-6 no-print">
+        <div class="bg-amber-950/95 backdrop-blur-md text-amber-50 px-4 py-3 rounded-2xl border border-amber-500/50 flex flex-wrap items-center justify-between gap-3 text-xs shadow-xl">
+            <div class="flex flex-wrap items-center gap-2.5">
+                <span class="px-2.5 py-1 rounded-lg bg-amber-500 text-slate-950 font-black whitespace-nowrap shrink-0">حالت مشاهده مدیر</span>
+                <span>
+                    نشست مدیر <strong class="text-white"><?= htmlspecialchars($impersonatorInfo['name'] ?? 'مدیر کل') ?></strong> فعال است
+                    · در حال مشاهده پنل سرپرست <strong class="text-amber-300"><?= htmlspecialchars($supervisor_name) ?></strong>
+                    (<span class="font-mono tabular-nums"><?= htmlspecialchars($supervisor_nid) ?></span>)
+                </span>
+            </div>
+            <form method="POST" class="shrink-0">
+                <input type="hidden" name="action_exit_impersonation" value="1">
+                <button type="submit" class="px-4 py-2 bg-white hover:bg-amber-100 text-slate-950 font-black rounded-xl shadow transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0">
+                    <span>↩</span>
+                    <span>بازگشت به پنل مدیر</span>
+                </button>
+            </form>
+        </div>
+    </div>
+    <?php endif; ?>
+    <!-- نوار وضعیت بالای پنل سرپرست -->
     <div class="max-w-7xl mx-auto my-3 px-4 sm:px-6 no-print">
         <div class="bg-slate-900 text-white px-4 py-2.5 rounded-2xl flex flex-wrap items-center justify-between gap-3 text-xs shadow-md">
             <div class="flex items-center gap-2">
-                <span class="w-2.5 h-2.5 rounded-full bg-amber-400 animate-pulse"></span>
+                <span class="w-2.5 h-2.5 rounded-full bg-amber-400"></span>
                 <span class="font-bold">پنل سرپرستی شبانه صمد - دانشگاه ملی مهارت</span>
                 <span class="text-slate-400">|</span>
-                <span class="text-amber-300 font-mono"><?= htmlspecialchars($persian_date_text) ?></span>
+                <span class="text-amber-300 font-mono tabular-nums"><?= htmlspecialchars($persian_date_text) ?></span>
             </div>
             <div class="flex items-center gap-2 flex-wrap">
-                <span class="text-[11px] text-slate-400">جابجایی بین نقش‌ها:</span>
-                <a href="manager_panel.php" class="px-2.5 py-1 bg-indigo-700 hover:bg-indigo-600 text-white rounded-lg font-bold transition-all flex items-center gap-1">
-                    <span>🏛️</span>
-                    <span>پنل مدیر کل</span>
-                </a>
-                <a href="dashboard.php" class="px-2.5 py-1 bg-emerald-700 hover:bg-emerald-600 text-white rounded-lg font-bold transition-all flex items-center gap-1">
-                    <span>🎓</span>
-                    <span>میزکار دانشجو</span>
-                </a>
-                <a href="index.php" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-all flex items-center gap-1">
+                <a href="index.php" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition-all flex items-center gap-1 whitespace-nowrap shrink-0">
                     <span>🌐</span>
                     <span>صفحه اصلی پرتال</span>
                 </a>
@@ -331,24 +409,39 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
         <!-- تب‌های پیمایش اصلی سرپرست -->
         <div class="bg-indigo-900/90 border-t border-indigo-800/80 px-4 sm:px-6">
             <div class="max-w-7xl mx-auto flex items-center gap-1 sm:gap-2 overflow-x-auto py-2">
-                <a href="?tab=attendance&date=<?= urlencode($current_date) ?>&floor=<?= urlencode($selected_floor) ?>" class="px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 <?= $active_tab === 'attendance' ? 'bg-white text-indigo-950 shadow-md' : 'text-indigo-200 hover:text-white hover:bg-indigo-800/60' ?>">
-                    <span>📋</span>
-                    <span>سرشماری شبانه دانشجویان</span>
-                </a>
-                <a href="?tab=cleanliness&date=<?= urlencode($current_date) ?>" class="px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 <?= $active_tab === 'cleanliness' ? 'bg-white text-indigo-950 shadow-md' : 'text-indigo-200 hover:text-white hover:bg-indigo-800/60' ?>">
-                    <span>✨</span>
-                    <span>نظافت شبانه خوابگاه‌ها (ارزیابی ۴ سطحی)</span>
-                </a>
-                <a href="?tab=facilities" class="px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 <?= $active_tab === 'facilities' ? 'bg-white text-indigo-950 shadow-md' : 'text-indigo-200 hover:text-white hover:bg-indigo-800/60' ?>">
-                    <span>🛠</span>
-                    <span>امکانات اتاق‌ها و گزارش خرابی/تعمیر</span>
-                    <?php 
-                        $pendingMaint = count(array_filter($myMaintenanceReports, fn($m) => $m['status'] === 'در انتظار اقدام' || $m['status'] === 'در حال تعمیر'));
-                        if ($pendingMaint > 0):
-                    ?>
-                        <span class="px-1.5 py-0.2 bg-rose-500 text-white rounded-full text-[10px] font-mono"><?= $pendingMaint ?></span>
-                    <?php endif; ?>
-                </a>
+                <?php if ($supCanAttendance): ?>
+                    <a href="?tab=attendance&date=<?= urlencode($current_date) ?>&floor=<?= urlencode($selected_floor) ?>" class="px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 <?= $active_tab === 'attendance' ? 'bg-white text-indigo-950 shadow-md' : 'text-indigo-200 hover:text-white hover:bg-indigo-800/60' ?>">
+                        <span>📋</span>
+                        <span>سرشماری شبانه دانشجویان</span>
+                    </a>
+                <?php endif; ?>
+                <?php if ($supCanCleanliness): ?>
+                    <a href="?tab=cleanliness&date=<?= urlencode($current_date) ?>" class="px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 <?= $active_tab === 'cleanliness' ? 'bg-white text-indigo-950 shadow-md' : 'text-indigo-200 hover:text-white hover:bg-indigo-800/60' ?>">
+                        <span>✨</span>
+                        <span>نظافت شبانه خوابگاه‌ها (ارزیابی ۴ سطحی)</span>
+                    </a>
+                <?php endif; ?>
+                <?php if ($supCanFacilities || $supCanMaintenanceReport): ?>
+                    <a href="?tab=facilities" class="px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 <?= $active_tab === 'facilities' ? 'bg-white text-indigo-950 shadow-md' : 'text-indigo-200 hover:text-white hover:bg-indigo-800/60' ?>">
+                        <span>🛠</span>
+                        <span><?= $supCanFacilities ? 'امکانات اتاق‌ها و گزارش خرابی/تعمیر' : 'گزارش خرابی/تعمیر تجهیزات' ?></span>
+                        <?php 
+                            $pendingMaint = count(array_filter($myMaintenanceReports, fn($m) => $m['status'] === 'در انتظار اقدام' || $m['status'] === 'در حال تعمیر'));
+                            if ($pendingMaint > 0):
+                        ?>
+                            <span class="px-1.5 py-0.5 bg-rose-500 text-white rounded-full text-[10px] font-mono tabular-nums"><?= $pendingMaint ?></span>
+                        <?php endif; ?>
+                    </a>
+                <?php endif; ?>
+                <?php if ($supCanGuestRequests): ?>
+                    <a href="?tab=guest_requests" class="px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 <?= $active_tab === 'guest_requests' ? 'bg-white text-indigo-950 shadow-md' : 'text-indigo-200 hover:text-white hover:bg-indigo-800/60' ?>">
+                        <span>🛏️</span>
+                        <span>درخواست‌های میهمان (فقط مشاهده)</span>
+                        <?php if ($supGuestPendingCount > 0): ?>
+                            <span class="px-1.5 py-0.5 bg-amber-500 text-slate-950 rounded-full text-[10px] font-mono tabular-nums font-black"><?= $supGuestPendingCount ?></span>
+                        <?php endif; ?>
+                    </a>
+                <?php endif; ?>
             </div>
         </div>
     </header>
@@ -678,26 +771,29 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
         <!-- ============================================================== -->
         <!-- تب ۳: امکانات اتاق‌ها و ارسال گزارش خرابی/تعمیر به مدیر -->
         <!-- ============================================================== -->
-        <?php elseif ($active_tab === 'facilities'): ?>
+        <?php elseif ($active_tab === 'facilities' && ($supCanFacilities || $supCanMaintenanceReport)): ?>
             <div class="space-y-6">
                 <!-- هدر و دکمه گزارش جدید -->
                 <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                     <div>
                         <h2 class="text-sm font-bold text-slate-900 flex items-center gap-2">
                             <span>🛠</span>
-                            <span>داشبورد امکانات خوابگاه‌ها و کارتابل گزارش خرابی / تعویض به مدیر</span>
+                            <span><?= $supCanFacilities ? 'داشبورد امکانات خوابگاه‌ها و کارتابل گزارش خرابی / تعویض به مدیر' : 'کارتابل ارسال گزارش خرابی / تعویض تجهیزات به مدیر' ?></span>
                         </h2>
                         <p class="text-xs text-slate-500 mt-0.5">
-                            سرپرست می‌تواند امکاناتی که مدیر ثبت کرده ببیند و در صورت نیاز به تعمیر یا تعویض هر قطعه (یا تخت)، فوراً گزارش کند تا مدیر اقدام و هزینه/فاکتور را ثبت نماید.
+                            <?= $supCanMaintenanceReport ? 'در صورت نیاز به تعمیر یا تعویض هر قطعه (یا تخت)، فوراً گزارش کنید تا مدیر اقدام و هزینه/فاکتور را ثبت نماید.' : 'مشاهده وضعیت تجهیزات و امکانات ثبت‌شده اتاق‌های خوابگاه.' ?>
                         </p>
                     </div>
 
-                    <button type="button" onclick="openReportModal()" class="px-4 py-2.5 bg-gradient-to-r from-rose-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center gap-2 cursor-pointer shrink-0">
-                        <span>🚨</span>
-                        <span>ارسال گزارش خرابی یا نقص تجهیز +</span>
-                    </button>
+                    <?php if ($supCanMaintenanceReport): ?>
+                        <button type="button" onclick="openReportModal()" class="px-4 py-2.5 bg-gradient-to-r from-rose-600 to-amber-600 hover:from-rose-500 hover:to-amber-500 text-white rounded-xl text-xs font-bold transition-all shadow-md flex items-center gap-2 cursor-pointer shrink-0">
+                            <span>🚨</span>
+                            <span>ارسال گزارش خرابی یا نقص تجهیز +</span>
+                        </button>
+                    <?php endif; ?>
                 </div>
 
+                <?php if ($supCanFacilities): ?>
                 <!-- کارت‌های امکانات ثبت‌شده اتاق‌ها توسط مدیر -->
                 <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                     <?php foreach ($roomsWithFacilities as $rf): ?>
@@ -759,6 +855,7 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
                                 </div>
                             <?php endif; ?>
 
+                            <?php if ($supCanMaintenanceReport): ?>
                             <!-- دکمه گزارش خرابی اختصاصی این اتاق -->
                             <div class="pt-2 border-t">
                                 <button type="button" onclick="openReportModal(<?= $rf['id'] ?>, '<?= htmlspecialchars($rf['room_number']) ?>', '<?= htmlspecialchars($rf['floor']) ?>')" class="w-full py-2 px-3 bg-rose-50 hover:bg-rose-100 text-rose-700 text-xs font-bold rounded-xl border border-rose-200 transition-colors flex items-center justify-center gap-1.5 cursor-pointer">
@@ -766,9 +863,11 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
                                     <span>گزارش خرابی یا نیاز به تعمیر در این اتاق</span>
                                 </button>
                             </div>
+                            <?php endif; ?>
                         </div>
                     <?php endforeach; ?>
                 </div>
+                <?php endif; ?>
 
                 <!-- کارتابل گزارش‌های ثبت‌شده سرپرست و وضعیت اقدام مدیر -->
                 <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-4">
@@ -857,8 +956,111 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
                 </div>
             </div>
         <?php endif; ?>
+
+        <!-- ============================================================== -->
+        <!-- تب ۴: مشاهده درخواست‌های اقامت میهمان دانشجویان (فقط خواندنی) -->
+        <!-- ============================================================== -->
+        <?php if ($active_tab === 'guest_requests' && $supCanGuestRequests): ?>
+            <div class="bg-white rounded-2xl border border-slate-200 p-6 shadow-xs space-y-5">
+                <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-4">
+                    <div>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <h2 class="text-base font-extrabold text-slate-900">درخواست‌های اقامت میهمان دانشجویان</h2>
+                            <span class="px-2.5 py-0.5 bg-slate-100 text-slate-700 border border-slate-300 rounded-lg text-[11px] font-bold">فقط خواندنی · بررسی و تایید بر عهده مدیر کل است</span>
+                        </div>
+                        <p class="text-xs text-slate-500 mt-1">
+                            اطلاعات درخواست‌های ثبت‌شده توسط دانشجویان جهت اطلاع سرپرست شبانه نمایش داده می‌شود. امکان تایید یا رد از پنل سرپرست وجود ندارد.
+                        </p>
+                    </div>
+                    <div class="flex items-center gap-2 text-xs font-mono tabular-nums">
+                        <span class="px-3 py-1.5 bg-amber-50 text-amber-800 border border-amber-200 rounded-xl font-bold">در انتظار: <?= $supGuestPendingCount ?></span>
+                        <span class="px-3 py-1.5 bg-slate-50 text-slate-700 border border-slate-200 rounded-xl font-bold">کل: <?= count($supGuestRequests) ?></span>
+                    </div>
+                </div>
+
+                <?php if (empty($supGuestRequests)): ?>
+                    <div class="p-8 text-center text-xs text-slate-400 bg-slate-50 border border-dashed border-slate-300 rounded-2xl">
+                        تاکنون هیچ درخواست اقامت میهمانی توسط دانشجویان ثبت نشده است.
+                    </div>
+                <?php else: ?>
+                    <div class="overflow-x-auto border border-slate-200 rounded-2xl">
+                        <table class="w-full text-right text-xs">
+                            <thead class="bg-slate-50 text-slate-700 border-b border-slate-200">
+                                <tr>
+                                    <th class="p-3">شماره · تاریخ</th>
+                                    <th class="p-3">مشخصات دانشجو</th>
+                                    <th class="p-3">وضعیت تقاضای خوابگاه</th>
+                                    <th class="p-3">مدت درخواستی</th>
+                                    <th class="p-3">شرح مشکل دانشجو</th>
+                                    <th class="p-3">وضعیت بررسی مدیر</th>
+                                </tr>
+                            </thead>
+                            <tbody class="divide-y divide-slate-100">
+                                <?php foreach ($supGuestRequests as $sgr): ?>
+                                    <?php
+                                        $sgrDateDisplay = trim((string)($sgr['submitted_jalali'] ?? ''));
+                                        if ($sgrDateDisplay === '' && !empty($sgr['created_at'])) {
+                                            $sgrTs = strtotime((string)$sgr['created_at']);
+                                            if ($sgrTs !== false) {
+                                                list($sJy, $sJm, $sJd) = gregorian_to_jalali((int)date('Y', $sgrTs), (int)date('n', $sgrTs), (int)date('j', $sgrTs));
+                                                $sgrDateDisplay = sprintf('%04d/%02d/%02d', $sJy, $sJm, $sJd);
+                                            } else {
+                                                $sgrDateDisplay = substr((string)$sgr['created_at'], 0, 10);
+                                            }
+                                        }
+                                        if ($sgrDateDisplay === '') {
+                                            $sgrDateDisplay = '-';
+                                        }
+                                    ?>
+                                    <tr class="hover:bg-slate-50/70 transition-colors">
+                                        <td class="p-3 font-mono tabular-nums text-slate-600 whitespace-nowrap">
+                                            #<?= (int)$sgr['id'] ?> · <?= htmlspecialchars($sgrDateDisplay) ?>
+                                        </td>
+                                        <td class="p-3">
+                                            <div class="font-bold text-slate-900"><?= htmlspecialchars($sgr['full_name']) ?></div>
+                                            <div class="text-[11px] text-slate-500 font-mono tabular-nums">
+                                                <?= htmlspecialchars($sgr['student_id']) ?> · <?= htmlspecialchars($sgr['campus']) ?>
+                                            </div>
+                                        </td>
+                                        <td class="p-3 whitespace-nowrap">
+                                            <?php if (!empty($sgr['was_dorm_applicant'])): ?>
+                                                <span class="px-2 py-0.5 bg-slate-100 text-slate-700 border border-slate-200 rounded-lg text-[11px] font-semibold">متقاضی قبلی خوابگاه</span>
+                                            <?php else: ?>
+                                                <span class="px-2.5 py-0.5 bg-amber-100 text-amber-900 border border-amber-300 rounded-lg text-[11px] font-bold">متقاضی خوابگاه از پیش نبوده (موقت)</span>
+                                            <?php endif; ?>
+                                        </td>
+                                        <td class="p-3 font-mono tabular-nums font-bold text-slate-800 whitespace-nowrap">
+                                            <?= (int)$sgr['requested_days'] ?> روز
+                                        </td>
+                                        <td class="p-3 text-slate-700 max-w-md leading-relaxed">
+                                            <?= nl2br(htmlspecialchars($sgr['problem_description'])) ?>
+                                        </td>
+                                        <td class="p-3 whitespace-nowrap">
+                                            <?php if ($sgr['status'] === 'approved'): ?>
+                                                <span class="px-2.5 py-1 bg-emerald-100 text-emerald-800 rounded-lg font-bold text-[11px] inline-block">
+                                                    تایید شد · اتاق <?= htmlspecialchars($sgr['assigned_room_number'] ?? '-') ?> (<?= (int)($sgr['approved_days'] ?? $sgr['requested_days']) ?> روز)
+                                                </span>
+                                            <?php elseif ($sgr['status'] === 'rejected'): ?>
+                                                <span class="px-2.5 py-1 bg-rose-100 text-rose-800 rounded-lg font-bold text-[11px] inline-block">
+                                                    رد شده توسط مدیر
+                                                </span>
+                                            <?php else: ?>
+                                                <span class="px-2.5 py-1 bg-amber-100 text-amber-800 rounded-lg font-bold text-[11px] inline-block">
+                                                    در انتظار تصمیم مدیر کل
+                                                </span>
+                                            <?php endif; ?>
+                                        </td>
+                                    </tr>
+                                <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endif; ?>
+            </div>
+        <?php endif; ?>
     </div>
 
+    <?php if ($supCanMaintenanceReport): ?>
     <!-- ============================================================== -->
     <!-- مودال ثبت گزارش خرابی و نقص امکانات/تخت توسط سرپرست -->
     <!-- ============================================================== -->
@@ -932,6 +1134,7 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
             </form>
         </div>
     </div>
+    <?php endif; ?>
 
     <!-- مودال کارت رسمی شناسایی سرپرست خوابگاه -->
     <div id="supervisorCardModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
@@ -964,30 +1167,30 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
                     <div>
                         <span class="text-[11px] text-indigo-300 block">نام و نام خانوادگی سرپرست:</span>
                         <span class="text-base font-bold text-white mt-0.5 block">
-                            <?= htmlspecialchars($_SESSION['admin_name'] ?? 'مهندس کامران قنبری') ?>
+                            <?= htmlspecialchars($supervisor_name) ?>
                         </span>
                     </div>
 
                     <div class="grid grid-cols-2 gap-3">
                         <div>
                             <span class="text-indigo-300 text-[11px] block">کد ملی (شناسه ورود):</span>
-                            <span class="font-mono text-sm font-bold text-amber-300 tracking-wider">
-                                <?= htmlspecialchars($_SESSION['admin_nid'] ?? '0099887766') ?>
+                            <span class="font-mono tabular-nums text-sm font-bold text-amber-300 tracking-wider">
+                                <?= htmlspecialchars($supervisor_nid) ?>
                             </span>
                         </div>
                         <div>
-                            <span class="text-indigo-300 text-[11px] block">شماره تماس اضطراری:</span>
-                            <span class="font-mono text-xs font-semibold text-slate-200" dir="ltr">09129876543</span>
+                            <span class="text-indigo-300 text-[11px] block">شماره تماس کشیک شبانه:</span>
+                            <span class="font-mono text-xs font-semibold text-slate-200">ثبت‌شده در پرونده کارگزینی</span>
                         </div>
                     </div>
 
                     <div class="p-3 bg-indigo-900/60 border border-indigo-600/50 rounded-xl space-y-1.5 shadow-xs">
                         <div class="flex items-center gap-1.5 text-amber-300 font-bold text-xs">
                             <span>⏱</span>
-                            <span>شیفت کاری: ۲۲:۰۰ الی ۰۶:۰۰ (شیفت سرشماری شبانه)</span>
+                            <span>شیفت کاری: <?= htmlspecialchars($supervisor_shift_hours) ?></span>
                         </div>
                         <div class="text-indigo-200 text-[11px]">
-                            <span>مسئولیت: <strong>سرپرست شبانه خوابگاه صمد - طبقات همکف، ۱ و ۲</strong></span>
+                            <span>روزهای کشیک: <strong><?= htmlspecialchars($supervisor_shift_days) ?></strong> · سرپرست شبانه خوابگاه صمد</span>
                         </div>
                         <div class="text-slate-300 text-[10px] pt-0.5 border-t border-indigo-700/50">
                             🏢 ساختمان مرکزی خوابگاه صمد (پردیس فناوری و مهارت)
@@ -997,7 +1200,7 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
             </div>
 
             <div class="mt-5 pt-3 border-t border-indigo-800/60 flex items-center justify-between text-xs">
-                <span class="text-slate-400 text-[11px]">شناسه سرپرستی: <strong class="text-amber-300 font-mono">SUP-405-01</strong></span>
+                <span class="text-slate-400 text-[11px]">شناسه سرپرستی: <strong class="text-amber-300 font-mono tabular-nums">SUP-<?= htmlspecialchars($supervisor_nid) ?></strong></span>
                 <div class="flex items-center gap-2">
                     <button type="button" onclick="window.print()" class="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer">
                         چاپ کارت
@@ -1087,7 +1290,7 @@ $myMaintenanceReports = $pdo->query("SELECT * FROM `maintenance_reports` ORDER B
                     </div>
                     <div class="text-center space-y-1">
                         <span>مسئول امور دانشجویی پردیس:</span>
-                        <strong class="block text-slate-900">دکتر علیرضا حسینی</strong>
+                        <strong class="block text-slate-900">مدیریت امور دانشجویی و خوابگاه‌ها</strong>
                         <div class="h-10 border-b border-dashed border-slate-400 w-36 mx-auto mt-1 flex items-center justify-center text-[10px] text-slate-400">محل مهر و تایید</div>
                     </div>
                 </div>

@@ -10,6 +10,9 @@ if (!defined('SAMAD_JWT_COOKIE')) {
 if (!defined('SAMAD_JWT_ISSUER')) {
     define('SAMAD_JWT_ISSUER', 'samad-tvu-portal');
 }
+if (!defined('SAMAD_MANAGER_DELETE_SECRET')) {
+    define('SAMAD_MANAGER_DELETE_SECRET', 'Q7#xM9!vK4');
+}
 
 function samad_base64url_encode(string $data): string
 {
@@ -39,26 +42,80 @@ function samad_default_rbac_matrix(): array
 {
     return [
         // دانشجو
-        ['student', 'dorm:room:view_self', 'مشاهده پرونده اسکان و کارت شناسایی خود', 1],
+        ['student', 'dorm:card:view_self', 'مشاهده و چاپ کارت هوشمند دانشجویی', 1],
+        ['student', 'dorm:room:view_self', 'مشاهده پرونده اسکان، هم‌اتاقی‌ها و گواهی سکونت', 1],
         ['student', 'dorm:graph:view_self', 'مشاهده گراف تعاملی اتاق و هم‌اتاقی‌ها', 1],
+        ['student', 'dorm:guest_request:submit', 'ثبت و پیگیری درخواست اقامت میهمان در خوابگاه', 1],
+        ['student', 'student:festivals:view', 'مشاهده تب مهارت‌ها، تیم‌های ورزشی و فراخوان‌ها', 1],
         ['student', 'skills:graph:view_self', 'مشاهده نقشه تعاملی مهارت‌ها و علایق دانشجو', 1],
         ['student', 'skills:graph:manage_self', 'افزودن، ویرایش و چیدمان مهارت‌ها در گراف شخصی', 1],
-        ['student', 'welfare:book', 'رزرو سانس سالن بدنسازی و مدیریت کیف پول', 1],
+        ['student', 'welfare:book', 'مشاهده خدمات رفاهی، شارژ کیف پول و رزرو سالن بدنسازی', 1],
         ['student', 'student:profile:edit', 'ویرایش شماره تماس و کلمه عبور دانشجویی', 1],
         // سرپرست شبانه
         ['supervisor', 'dorm:attendance:manage', 'ثبت و مدیریت سرشماری شبانه دانشجویان', 1],
         ['supervisor', 'dorm:cleanliness:manage', 'ارزیابی شب به شب کیفیت نظافت اتاق‌ها', 1],
         ['supervisor', 'dorm:maintenance:report', 'ثبت گزارش خرابی و درخواست تعمیر تجهیزات', 1],
         ['supervisor', 'dorm:facilities:view', 'مشاهده شناسنامه امکانات اتاق‌ها', 1],
+        ['supervisor', 'dorm:guest_request:view', 'مشاهده درخواست‌های اقامت میهمان دانشجویان (فقط خواندنی)', 1],
         // مدیر دانشگاه
-        ['manager', 'dorm:graph:view_all', 'مشاهده گراف جامع کل ساختمان، طبقات و ساکنان', 1],
+        ['manager', 'dorm:overview:view', 'پیشخوان، آمار کلی و وضعیت طبقات', 1],
+        ['manager', 'dorm:admitted:manage', 'پذیرش دانشجوی جدید در جدول منبع', 1],
+        ['manager', 'dorm:unhoused:manage', 'مدیریت متقاضیان خوابگاه در صف اسکان', 1],
+        ['manager', 'dorm:student:purge', 'حذف کلی دانشجوی متقاضی خوابگاه از تمامی جداول و سامانه', 1],
         ['manager', 'dorm:rooms:manage', 'مدیریت اتاق‌ها، طبقات و ظرفیت خوابگاه', 1],
-        ['manager', 'dorm:allocations:manage', 'اسکان دانشجویان، تغییر اتاق و میهمانی', 1],
-        ['manager', 'dorm:attendance:manage', 'نظارت و چاپ گزارش‌های سرشماری شبانه', 1],
-        ['manager', 'dorm:cleanliness:manage', 'نظارت بر رتبه‌بندی نظافت خوابگاه', 1],
+        ['manager', 'dorm:graph:view_all', 'مشاهده گراف جامع کل ساختمان، طبقات و ساکنان', 1],
+        ['manager', 'dorm:facilities:manage', 'تکمیل شناسنامه امکانات و تجهیزات اتاق‌ها', 1],
         ['manager', 'dorm:maintenance:resolve', 'رسیدگی به خرابی‌ها و ثبت فاکتور تعمیرات', 1],
+        ['manager', 'dorm:cleanliness:manage', 'نظارت بر رتبه‌بندی نظافت و خروجی اکسل', 1],
+        ['manager', 'dorm:allocations:manage', 'دانشجویان ساکن، تغییر اتاق و میهمانی', 1],
+        ['manager', 'dorm:guest_request:manage', 'بررسی، تایید یا رد درخواست‌های اقامت میهمان دانشجویان', 1],
+        ['manager', 'dorm:student_panel:impersonate', 'ورود از کارت دانشجویی به پنل دانشجو (با حفظ نشست مدیر)', 1],
+        ['manager', 'dorm:supervisor_panel:impersonate', 'ورود از کارت سرپرست به پنل سرپرست شبانه (با حفظ نشست مدیر)', 1],
+        ['manager', 'dorm:attendance:manage', 'سرشماری شبانه، چاپ و خروجی اکسل', 1],
+        ['manager', 'dorm:supervisors:manage', 'مدیریت سرپرستان، شیفت‌ها و کاربران مدیر', 1],
+        ['manager', 'dorm:festivals:manage', 'جشنواره‌ها، داوطلبان و صدور فراخوان', 1],
+        ['manager', 'dorm:skills:view', 'مشاهده بانک مهارت‌ها و استعدادیابی', 1],
         ['manager', 'welfare:manage', 'مدیریت خدمات رفاهی و سانس‌های ورزشی', 1],
         ['manager', 'auth:tokens:manage', 'مدیریت توکن‌های JWT، ابطال نشست و ماتریس دسترسی', 1],
+    ];
+}
+
+function samad_manager_permission_catalog(): array
+{
+    $catalog = [];
+    foreach (samad_default_rbac_matrix() as $row) {
+        if ($row[0] === 'manager') {
+            $catalog[$row[1]] = $row[2];
+        }
+    }
+    return $catalog;
+}
+
+function samad_default_student_action_limits(): array
+{
+    return [
+        // [action_key, action_label, permission_key, category, max_count, window_days, is_limit_enabled, sort_order]
+        ['student:profile:change_mobile', 'تغییر شماره تلفن همراه دانشجو', 'student:profile:edit', 'پروفایل و هویت', 1, 30, 1, 10],
+        ['student:profile:change_password', 'تغییر کلمه عبور حساب دانشجویی', 'student:profile:edit', 'پروفایل و هویت', 2, 30, 1, 20],
+        ['dorm:guest_request:submit', 'ثبت درخواست اقامت میهمان در خوابگاه', 'dorm:guest_request:submit', 'خوابگاه و اسکان', 2, 30, 1, 30],
+        ['dorm:card:print', 'چاپ رسمی کارت هوشمند دانشجویی (A4)', 'dorm:card:view_self', 'خوابگاه و اسکان', 5, 30, 1, 40],
+        ['dorm:certificate:print', 'چاپ گواهی رسمی سکونت در خوابگاه (A4)', 'dorm:room:view_self', 'خوابگاه و اسکان', 3, 30, 1, 50],
+        ['dorm:graph:view_self', 'مشاهده و بارگذاری گراف تعاملی اتاق و هم‌اتاقی‌ها', 'dorm:graph:view_self', 'خوابگاه و اسکان', 60, 1, 1, 60],
+        ['welfare:wallet_charge', 'شارژ آنلاین کیف پول الکترونیک', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 5, 7, 1, 70],
+        ['welfare:book_gym', 'رزرو سانس سالن بدنسازی', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 4, 7, 1, 80],
+        ['welfare:gym_ticket:print', 'چاپ بلیت دیجیتال سالن بدنسازی (A4)', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 10, 7, 1, 90],
+        ['skills:graph:view_self', 'مشاهده و بارگذاری نقشه گراف مهارت‌ها', 'skills:graph:view_self', 'گراف مهارت‌ها و علایق', 60, 1, 1, 100],
+        ['skills:graph:attach_domain', 'افزودن حوزه رسمی دانشگاه به گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 10, 30, 1, 110],
+        ['skills:graph:detach_domain', 'حذف / جدا کردن حوزه از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 10, 30, 1, 120],
+        ['skills:graph:create_node', 'ایجاد باکس جدید (مهارت / علاقه / دستاورد / رویداد)', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 15, 7, 1, 130],
+        ['skills:graph:update_node', 'ویرایش مشخصات باکس در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 140],
+        ['skills:graph:delete_node', 'حذف باکس شخصی از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 15, 7, 1, 150],
+        ['skills:graph:create_edge', 'ایجاد خط ارتباطی جدید در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 160],
+        ['skills:graph:update_edge', 'ویرایش خط ارتباطی در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 170],
+        ['skills:graph:delete_edge', 'حذف خط ارتباطی از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 20, 7, 1, 180],
+        ['skills:graph:save_layout', 'ذخیره چیدمان و مختصات گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 100, 1, 1, 190],
+        ['skills:graph:reset', 'بازنشانی کامل گراف مهارت‌ها به حالت پیش‌فرض', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 2, 30, 1, 200],
+        ['auth:jwt:refresh', 'تمدید و چرخش توکن JWT نشست دانشجو', 'student:profile:edit', 'امنیت و نشست JWT', 10, 1, 1, 210],
     ];
 }
 
@@ -164,6 +221,30 @@ function samad_ensure_jwt_schema(PDO $pdo, bool $force = false): ?string
         $errors[] = 'auth_audit_logs: ' . $err4;
     }
 
+    $err5 = samad_exec_ddl_with_fallback($pdo, "
+        CREATE TABLE IF NOT EXISTS `auth_user_permissions` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `subject_id` VARCHAR(64) NOT NULL,
+            `role` ENUM('student', 'supervisor', 'manager') NOT NULL,
+            `permission_key` VARCHAR(80) NOT NULL,
+            `is_allowed` TINYINT(1) NOT NULL DEFAULT 1,
+            `updated_by` VARCHAR(64) DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY `uk_user_perm` (`subject_id`, `role`, `permission_key`),
+            INDEX `idx_user_perm_sub` (`subject_id`, `role`)
+        )
+    ");
+    if ($err5 !== null) {
+        $errors[] = 'auth_user_permissions: ' . $err5;
+    }
+
+    try {
+        $chkAdminCreator = $pdo->query("SHOW COLUMNS FROM `admins` LIKE 'created_by_national_id'")->fetchAll();
+        if (empty($chkAdminCreator)) {
+            $pdo->exec("ALTER TABLE `admins` ADD COLUMN `created_by_national_id` VARCHAR(30) DEFAULT NULL AFTER `role`");
+        }
+    } catch (Throwable $e) {}
+
     if ($err1 === null) {
         try {
             $chkSecret = $pdo->query("SELECT `setting_value` FROM `auth_settings` WHERE `setting_key` = 'jwt_secret' LIMIT 1")->fetchColumn();
@@ -180,18 +261,75 @@ function samad_ensure_jwt_schema(PDO $pdo, bool $force = false): ?string
     if ($err2 === null) {
         try {
             $defaultPerms = samad_default_rbac_matrix();
-            $existingCount = (int)$pdo->query("SELECT COUNT(*) FROM `auth_role_permissions`")->fetchColumn();
-            if ($existingCount < count($defaultPerms)) {
-                $stmtPermSeed = $pdo->prepare("
-                    INSERT IGNORE INTO `auth_role_permissions` (`role`, `permission_key`, `permission_label`, `is_allowed`)
-                    VALUES (?, ?, ?, ?)
-                ");
-                foreach ($defaultPerms as $permRow) {
+            $existingPairs = $pdo->query("SELECT CONCAT(`role`, ':', `permission_key`) FROM `auth_role_permissions`")->fetchAll(PDO::FETCH_COLUMN);
+            $existingMap = is_array($existingPairs) ? array_flip($existingPairs) : [];
+            $stmtPermSeed = $pdo->prepare("
+                INSERT IGNORE INTO `auth_role_permissions` (`role`, `permission_key`, `permission_label`, `is_allowed`)
+                VALUES (?, ?, ?, ?)
+            ");
+            foreach ($defaultPerms as $permRow) {
+                $pairKey = $permRow[0] . ':' . $permRow[1];
+                if (!isset($existingMap[$pairKey])) {
                     $stmtPermSeed->execute($permRow);
                 }
             }
         } catch (Throwable $e) {
             $errors[] = 'auth_role_permissions seed: ' . $e->getMessage();
+        }
+    }
+
+    $err6 = samad_exec_ddl_with_fallback($pdo, "
+        CREATE TABLE IF NOT EXISTS `auth_student_action_limits` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `action_key` VARCHAR(80) NOT NULL UNIQUE,
+            `action_label` VARCHAR(180) NOT NULL,
+            `permission_key` VARCHAR(80) NOT NULL,
+            `category` VARCHAR(60) NOT NULL,
+            `max_count` INT NOT NULL DEFAULT 1,
+            `window_days` INT NOT NULL DEFAULT 30,
+            `is_limit_enabled` TINYINT(1) NOT NULL DEFAULT 1,
+            `sort_order` INT NOT NULL DEFAULT 0,
+            `updated_by` VARCHAR(64) DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+    ");
+    if ($err6 !== null) {
+        $errors[] = 'auth_student_action_limits: ' . $err6;
+    }
+
+    $err7 = samad_exec_ddl_with_fallback($pdo, "
+        CREATE TABLE IF NOT EXISTS `auth_student_action_logs` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `student_id` VARCHAR(20) NOT NULL,
+            `action_key` VARCHAR(80) NOT NULL,
+            `detail` VARCHAR(255) DEFAULT NULL,
+            `ip_address` VARCHAR(64) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX `idx_sal_student_action_time` (`student_id`, `action_key`, `created_at`),
+            INDEX `idx_sal_action_time` (`action_key`, `created_at`)
+        )
+    ");
+    if ($err7 !== null) {
+        $errors[] = 'auth_student_action_logs: ' . $err7;
+    }
+
+    if ($err6 === null) {
+        try {
+            $defaultLimits = samad_default_student_action_limits();
+            $existingLimKeys = $pdo->query("SELECT `action_key` FROM `auth_student_action_limits`")->fetchAll(PDO::FETCH_COLUMN);
+            $existingLimMap = is_array($existingLimKeys) ? array_flip($existingLimKeys) : [];
+            $stmtLimSeed = $pdo->prepare("
+                INSERT IGNORE INTO `auth_student_action_limits`
+                    (`action_key`, `action_label`, `permission_key`, `category`, `max_count`, `window_days`, `is_limit_enabled`, `sort_order`)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ");
+            foreach ($defaultLimits as $limRow) {
+                if (!isset($existingLimMap[$limRow[0]])) {
+                    $stmtLimSeed->execute($limRow);
+                }
+            }
+        } catch (Throwable $e) {
+            $errors[] = 'auth_student_action_limits seed: ' . $e->getMessage();
         }
     }
 
@@ -253,6 +391,59 @@ function samad_get_role_permissions(PDO $pdo, string $role): array
         }
     }
     return $fallback;
+}
+
+function samad_get_user_permission_overrides(PDO $pdo, string $subjectId, string $role): array
+{
+    samad_ensure_jwt_schema($pdo);
+    $map = [];
+    try {
+        $stmt = $pdo->prepare("SELECT `permission_key`, `is_allowed` FROM `auth_user_permissions` WHERE `subject_id` = ? AND `role` = ?");
+        $stmt->execute([$subjectId, $role]);
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $map[(string)$row['permission_key']] = ((int)$row['is_allowed'] === 1);
+        }
+    } catch (Throwable $e) {}
+    return $map;
+}
+
+function samad_get_effective_permissions(PDO $pdo, string $subjectId, string $role): array
+{
+    $rolePerms = samad_get_role_permissions($pdo, $role);
+    if ($role !== 'manager' || trim($subjectId) === '') {
+        return $rolePerms;
+    }
+    $overrides = samad_get_user_permission_overrides($pdo, $subjectId, $role);
+    if (empty($overrides)) {
+        return $rolePerms;
+    }
+    $effective = [];
+    foreach ($rolePerms as $permKey) {
+        if (!empty($overrides[$permKey])) {
+            $effective[] = $permKey;
+        }
+    }
+    return $effective;
+}
+
+function samad_set_user_permissions(PDO $pdo, string $subjectId, string $role, array $allowedKeys, string $updatedBy): void
+{
+    samad_ensure_jwt_schema($pdo);
+    $allKeys = array_keys(samad_manager_permission_catalog());
+    $allowedSet = array_flip(array_map('strval', $allowedKeys));
+
+    $stmt = $pdo->prepare("
+        INSERT INTO `auth_user_permissions` (`subject_id`, `role`, `permission_key`, `is_allowed`, `updated_by`)
+        VALUES (?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+            `is_allowed` = VALUES(`is_allowed`),
+            `updated_by` = VALUES(`updated_by`),
+            `updated_at` = CURRENT_TIMESTAMP
+    ");
+    foreach ($allKeys as $key) {
+        $isAllowed = isset($allowedSet[$key]) ? 1 : 0;
+        $stmt->execute([$subjectId, $role, $key, $isAllowed, substr($updatedBy, 0, 64)]);
+    }
 }
 
 function samad_log_auth_event(
@@ -324,7 +515,7 @@ function samad_issue_jwt(
     $ttl = $remember ? (7 * 86400) : (8 * 3600); // ۸ ساعت عادی یا ۷ روز در حالت مرا به خاطر بسپار
     $expiresAt = $now + $ttl;
     $jti = bin2hex(random_bytes(16));
-    $permissions = samad_get_role_permissions($pdo, $role);
+    $permissions = samad_get_effective_permissions($pdo, $subjectId, $role);
 
     $header = [
         'alg' => 'HS256',
@@ -579,8 +770,8 @@ function samad_verify_jwt(PDO $pdo, ?string $rawToken = null, bool $touchLastUse
         }
     } catch (Throwable $e) {}
 
-    // همگام‌سازی مجوزهای زنده نقش از ماتریس RBAC
-    $livePermissions = samad_get_role_permissions($pdo, $role);
+    // همگام‌سازی مجوزهای زنده نقش و سیاست اختصاصی کاربر از ماتریس RBAC
+    $livePermissions = samad_get_effective_permissions($pdo, $sub, $role);
 
     return [
         'valid' => true,
@@ -654,9 +845,217 @@ function samad_clear_session_auth(): void
             $_SESSION['admin_name'],
             $_SESSION['admin_role'],
             $_SESSION['samad_jwt_token'],
-            $_SESSION['samad_jwt_jti']
+            $_SESSION['samad_jwt_jti'],
+            $_SESSION['samad_impersonate_student'],
+            $_SESSION['samad_impersonate_supervisor']
         );
     }
+}
+
+function samad_start_student_impersonation(PDO $pdo, array $managerAuth, array $studentRow): void
+{
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        return;
+    }
+    $targetSid = trim((string)($studentRow['student_id'] ?? ''));
+    $targetName = trim((string)($studentRow['full_name'] ?? 'دانشجو'));
+    if ($targetSid === '') {
+        return;
+    }
+    $_SESSION['samad_impersonate_student'] = [
+        'student_id' => $targetSid,
+        'student_name' => $targetName,
+        'manager_sub' => (string)($managerAuth['sub'] ?? ''),
+        'manager_name' => (string)($managerAuth['name'] ?? ''),
+        'manager_jti' => (string)($managerAuth['jti'] ?? ''),
+        'started_at' => time(),
+    ];
+    $_SESSION['student_id'] = $targetSid;
+    $_SESSION['student_name'] = $targetName;
+    if (isset($studentRow['national_id'])) {
+        $_SESSION['national_id'] = (string)$studentRow['national_id'];
+    }
+    if (isset($studentRow['campus'])) {
+        $_SESSION['campus'] = (string)$studentRow['campus'];
+    }
+    if (isset($studentRow['field_of_study'])) {
+        $_SESSION['field'] = (string)$studentRow['field_of_study'];
+    }
+
+    samad_log_auth_event(
+        $pdo,
+        'manager_impersonate_start',
+        (string)($managerAuth['sub'] ?? ''),
+        'manager',
+        (string)($managerAuth['jti'] ?? ''),
+        (string)($_SERVER['SCRIPT_NAME'] ?? 'manager_panel.php'),
+        200,
+        "ورود مدیر ({$managerAuth['name']}) به پنل دانشجو {$targetName} ({$targetSid}) با حفظ نشست مدیر"
+    );
+}
+
+function samad_stop_student_impersonation(PDO $pdo, bool $logEvent = true): void
+{
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        return;
+    }
+    $imp = $_SESSION['samad_impersonate_student'] ?? null;
+    if ($logEvent && is_array($imp) && !empty($imp['student_id'])) {
+        samad_log_auth_event(
+            $pdo,
+            'manager_impersonate_end',
+            (string)($imp['manager_sub'] ?? ''),
+            'manager',
+            (string)($imp['manager_jti'] ?? ''),
+            (string)($_SERVER['SCRIPT_NAME'] ?? 'dashboard.php'),
+            200,
+            "بازگشت مدیر ({$imp['manager_name']}) از پنل دانشجو {$imp['student_name']} ({$imp['student_id']}) به پنل مدیریت"
+        );
+    }
+    unset(
+        $_SESSION['samad_impersonate_student'],
+        $_SESSION['student_id'],
+        $_SESSION['student_name'],
+        $_SESSION['national_id'],
+        $_SESSION['campus'],
+        $_SESSION['field']
+    );
+}
+
+function samad_start_supervisor_impersonation(PDO $pdo, array $managerAuth, array $supervisorRow): void
+{
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        return;
+    }
+    $targetNid = trim((string)($supervisorRow['national_id'] ?? ''));
+    $targetName = trim((string)($supervisorRow['full_name'] ?? 'سرپرست شبانه'));
+    if ($targetNid === '') {
+        return;
+    }
+    unset($_SESSION['samad_impersonate_student']);
+    $_SESSION['samad_impersonate_supervisor'] = [
+        'supervisor_nid' => $targetNid,
+        'supervisor_name' => $targetName,
+        'shift_days' => trim((string)($supervisorRow['shift_days'] ?? '')),
+        'shift_hours' => trim((string)($supervisorRow['shift_hours'] ?? '')),
+        'manager_sub' => (string)($managerAuth['sub'] ?? ''),
+        'manager_name' => (string)($managerAuth['name'] ?? ''),
+        'manager_jti' => (string)($managerAuth['jti'] ?? ''),
+        'started_at' => time(),
+    ];
+
+    samad_log_auth_event(
+        $pdo,
+        'manager_impersonate_supervisor_start',
+        (string)($managerAuth['sub'] ?? ''),
+        'manager',
+        (string)($managerAuth['jti'] ?? ''),
+        (string)($_SERVER['SCRIPT_NAME'] ?? 'manager_panel.php'),
+        200,
+        "ورود مدیر ({$managerAuth['name']}) به پنل سرپرست {$targetName} ({$targetNid}) با حفظ نشست مدیر"
+    );
+}
+
+function samad_stop_supervisor_impersonation(PDO $pdo, bool $logEvent = true): void
+{
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        return;
+    }
+    $imp = $_SESSION['samad_impersonate_supervisor'] ?? null;
+    if ($logEvent && is_array($imp) && !empty($imp['supervisor_nid'])) {
+        samad_log_auth_event(
+            $pdo,
+            'manager_impersonate_supervisor_end',
+            (string)($imp['manager_sub'] ?? ''),
+            'manager',
+            (string)($imp['manager_jti'] ?? ''),
+            (string)($_SERVER['SCRIPT_NAME'] ?? 'supervisor_panel.php'),
+            200,
+            "بازگشت مدیر ({$imp['manager_name']}) از پنل سرپرست {$imp['supervisor_name']} ({$imp['supervisor_nid']}) به پنل مدیریت"
+        );
+    }
+    unset($_SESSION['samad_impersonate_supervisor']);
+}
+
+function samad_resolve_impersonation_context(PDO $pdo, array $verified, array $allowedRoles): array
+{
+    if (empty($verified['valid']) || ($verified['role'] ?? '') !== 'manager') {
+        return $verified;
+    }
+    if (session_status() !== PHP_SESSION_ACTIVE) {
+        return $verified;
+    }
+
+    // ۱. بررسی ورود موقت مدیر به پنل دانشجو
+    if (!empty($_SESSION['samad_impersonate_student']) && is_array($_SESSION['samad_impersonate_student'])) {
+        $imp = $_SESSION['samad_impersonate_student'];
+        $targetSid = trim((string)($imp['student_id'] ?? ''));
+        if ($targetSid === '' || ($imp['manager_jti'] ?? '') !== ($verified['jti'] ?? '')) {
+            unset($_SESSION['samad_impersonate_student']);
+        } elseif (!samad_has_permission($verified, 'dorm:student_panel:impersonate')) {
+            samad_stop_student_impersonation($pdo, false);
+        } else {
+            $wantsStudent = in_array('student', $allowedRoles, true) && (
+                !in_array('manager', $allowedRoles, true) ||
+                (($_GET['role'] ?? '') === 'student') ||
+                strpos((string)($_SERVER['HTTP_REFERER'] ?? ''), 'dashboard.php') !== false ||
+                strpos((string)($_SERVER['HTTP_REFERER'] ?? ''), 'role=student') !== false
+            );
+            if ($wantsStudent) {
+                $resolved = $verified;
+                $resolved['is_impersonating'] = true;
+                $resolved['impersonator'] = [
+                    'sub' => (string)$verified['sub'],
+                    'name' => (string)$verified['name'],
+                    'role' => 'manager',
+                    'jti' => (string)$verified['jti'],
+                    'started_at' => (int)($imp['started_at'] ?? time()),
+                ];
+                $resolved['role'] = 'student';
+                $resolved['sub'] = $targetSid;
+                $resolved['name'] = (string)($imp['student_name'] ?? $targetSid);
+                $resolved['permissions'] = samad_get_effective_permissions($pdo, $targetSid, 'student');
+                return $resolved;
+            }
+        }
+    }
+
+    // ۲. بررسی ورود موقت مدیر به پنل سرپرست شبانه
+    if (!empty($_SESSION['samad_impersonate_supervisor']) && is_array($_SESSION['samad_impersonate_supervisor'])) {
+        $impSup = $_SESSION['samad_impersonate_supervisor'];
+        $targetNid = trim((string)($impSup['supervisor_nid'] ?? ''));
+        if ($targetNid === '' || ($impSup['manager_jti'] ?? '') !== ($verified['jti'] ?? '')) {
+            unset($_SESSION['samad_impersonate_supervisor']);
+        } elseif (!samad_has_permission($verified, 'dorm:supervisor_panel:impersonate')) {
+            samad_stop_supervisor_impersonation($pdo, false);
+        } else {
+            $wantsSupervisor = in_array('supervisor', $allowedRoles, true) && (
+                !in_array('manager', $allowedRoles, true) ||
+                (($_GET['role'] ?? '') === 'supervisor') ||
+                strpos((string)($_SERVER['HTTP_REFERER'] ?? ''), 'supervisor_panel.php') !== false ||
+                strpos((string)($_SERVER['HTTP_REFERER'] ?? ''), 'role=supervisor') !== false
+            );
+            if ($wantsSupervisor) {
+                $resolved = $verified;
+                $resolved['is_impersonating'] = true;
+                $resolved['is_supervisor_impersonating'] = true;
+                $resolved['impersonator'] = [
+                    'sub' => (string)$verified['sub'],
+                    'name' => (string)$verified['name'],
+                    'role' => 'manager',
+                    'jti' => (string)$verified['jti'],
+                    'started_at' => (int)($impSup['started_at'] ?? time()),
+                ];
+                $resolved['role'] = 'supervisor';
+                $resolved['sub'] = $targetNid;
+                $resolved['name'] = (string)($impSup['supervisor_name'] ?? $targetNid);
+                $resolved['permissions'] = samad_get_effective_permissions($pdo, $targetNid, 'supervisor');
+                return $resolved;
+            }
+        }
+    }
+
+    return $verified;
 }
 
 function samad_render_forbidden_page(string $title, string $detail, string $currentRole): void
@@ -734,6 +1133,7 @@ function samad_require_page_jwt(
         exit;
     }
 
+    $verified = samad_resolve_impersonation_context($pdo, $verified, $allowedRoles);
     $role = $verified['role'];
     if (!in_array($role, $allowedRoles, true)) {
         samad_log_auth_event(
@@ -778,7 +1178,8 @@ function samad_require_page_jwt(
         if ($role === 'student') {
             $_SESSION['student_id'] = $verified['sub'];
             $_SESSION['student_name'] = $verified['name'];
-        } else {
+            // در حالت ورود مدیر به پنل دانشجو، متغیرهای نشست مدیر دست‌نخورده حفظ می‌شوند
+        } elseif (empty($verified['is_impersonating'])) {
             $_SESSION['admin_role'] = $role;
             $_SESSION['admin_name'] = $verified['name'];
             $_SESSION['admin_national_id'] = $verified['sub'];
@@ -819,6 +1220,7 @@ function samad_require_api_jwt(PDO $pdo, array $allowedRoles, ?string $requiredP
         ]);
     }
 
+    $verified = samad_resolve_impersonation_context($pdo, $verified, $allowedRoles);
     $role = $verified['role'];
     if (!in_array($role, $allowedRoles, true)) {
         samad_log_auth_event(
@@ -874,3 +1276,197 @@ function samad_format_remaining_ttl(int $expiresAt): string
     }
     return "{$mins} دقیقه";
 }
+
+function samad_get_student_action_limits(PDO $pdo): array
+{
+    samad_ensure_jwt_schema($pdo);
+    $rows = [];
+    try {
+        $stmt = $pdo->query("SELECT * FROM `auth_student_action_limits` ORDER BY `sort_order` ASC, `id` ASC");
+        if ($stmt) {
+            $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        }
+    } catch (Throwable $e) {
+        $rows = [];
+    }
+
+    if (empty($rows)) {
+        foreach (samad_default_student_action_limits() as $item) {
+            $rows[] = [
+                'action_key' => $item[0],
+                'action_label' => $item[1],
+                'permission_key' => $item[2],
+                'category' => $item[3],
+                'max_count' => $item[4],
+                'window_days' => $item[5],
+                'is_limit_enabled' => $item[6],
+                'sort_order' => $item[7],
+            ];
+        }
+    }
+
+    $indexed = [];
+    foreach ($rows as $row) {
+        $indexed[(string)$row['action_key']] = [
+            'id' => (int)($row['id'] ?? 0),
+            'action_key' => (string)$row['action_key'],
+            'action_label' => (string)$row['action_label'],
+            'permission_key' => (string)$row['permission_key'],
+            'category' => (string)$row['category'],
+            'max_count' => max(0, (int)$row['max_count']),
+            'window_days' => max(1, (int)$row['window_days']),
+            'is_limit_enabled' => ((int)$row['is_limit_enabled']) === 1,
+            'sort_order' => (int)($row['sort_order'] ?? 0),
+            'updated_by' => $row['updated_by'] ?? null,
+            'updated_at' => $row['updated_at'] ?? null,
+        ];
+    }
+    return $indexed;
+}
+
+function samad_get_student_action_limit(PDO $pdo, string $actionKey): ?array
+{
+    $all = samad_get_student_action_limits($pdo);
+    return $all[$actionKey] ?? null;
+}
+
+function samad_check_student_rate_limit(PDO $pdo, string $studentId, string $actionKey): array
+{
+    samad_ensure_jwt_schema($pdo);
+    $cfg = samad_get_student_action_limit($pdo, $actionKey);
+    if (!$cfg) {
+        return [
+            'allowed' => true,
+            'action_key' => $actionKey,
+            'action_label' => $actionKey,
+            'is_limit_enabled' => false,
+            'used' => 0,
+            'max_count' => 0,
+            'window_days' => 1,
+            'remaining' => 999999,
+            'message' => '',
+        ];
+    }
+
+    $windowDays = max(1, (int)$cfg['window_days']);
+    $maxCount = max(0, (int)$cfg['max_count']);
+    $isEnabled = (bool)$cfg['is_limit_enabled'];
+    $used = 0;
+    $oldestAt = null;
+
+    try {
+        $stmt = $pdo->prepare("
+            SELECT COUNT(*) AS cnt, MIN(`created_at`) AS oldest_at
+            FROM `auth_student_action_logs`
+            WHERE `student_id` = ?
+              AND `action_key` = ?
+              AND `created_at` >= DATE_SUB(NOW(), INTERVAL ? DAY)
+        ");
+        $stmt->execute([$studentId, $actionKey, $windowDays]);
+        $stats = $stmt->fetch(PDO::FETCH_ASSOC);
+        $used = (int)($stats['cnt'] ?? 0);
+        $oldestAt = $stats['oldest_at'] ?? null;
+    } catch (Throwable $e) {
+        $used = 0;
+    }
+
+    if (!$isEnabled) {
+        return [
+            'allowed' => true,
+            'action_key' => $actionKey,
+            'action_label' => $cfg['action_label'],
+            'is_limit_enabled' => false,
+            'used' => $used,
+            'max_count' => $maxCount,
+            'window_days' => $windowDays,
+            'remaining' => 999999,
+            'message' => '',
+        ];
+    }
+
+    $allowed = ($used < $maxCount);
+    $remaining = max(0, $maxCount - $used);
+    $msg = '';
+
+    if (!$allowed) {
+        if ($maxCount === 0) {
+            $msg = "امکان انجام عملیات «{$cfg['action_label']}» با سقف مجاز ۰ در پنل مدیریت موقتاً مسدود شده است.";
+        } else {
+            $retryInfo = '';
+            if (!empty($oldestAt)) {
+                $resetTs = strtotime((string)$oldestAt . " + {$windowDays} days");
+                if ($resetTs !== false && $resetTs > time()) {
+                    $diffHours = (int)ceil(($resetTs - time()) / 3600);
+                    if ($diffHours >= 24) {
+                        $diffDays = (int)ceil($diffHours / 24);
+                        $retryInfo = " (بازنشانی سهمیه بعدی تا حدود {$diffDays} روز دیگر)";
+                    } else {
+                        $retryInfo = " (بازنشانی سهمیه بعدی تا حدود {$diffHours} ساعت دیگر)";
+                    }
+                }
+            }
+            $msg = "سقف مجاز برای «{$cfg['action_label']}» (حداکثر {$maxCount} بار در بازه {$windowDays} روز) تکمیل شده است. میزان مصرف شما: {$used} از {$maxCount}{$retryInfo}.";
+        }
+    }
+
+    return [
+        'allowed' => $allowed,
+        'action_key' => $actionKey,
+        'action_label' => $cfg['action_label'],
+        'is_limit_enabled' => true,
+        'used' => $used,
+        'max_count' => $maxCount,
+        'window_days' => $windowDays,
+        'remaining' => $remaining,
+        'message' => $msg,
+    ];
+}
+
+function samad_record_student_action(PDO $pdo, string $studentId, string $actionKey, string $detail = ''): void
+{
+    if (trim($studentId) === '' || trim($actionKey) === '') {
+        return;
+    }
+    samad_ensure_jwt_schema($pdo);
+    try {
+        $stmt = $pdo->prepare("
+            INSERT INTO `auth_student_action_logs` (`student_id`, `action_key`, `detail`, `ip_address`, `created_at`)
+            VALUES (?, ?, ?, ?, NOW())
+        ");
+        $stmt->execute([
+            substr(trim($studentId), 0, 20),
+            substr(trim($actionKey), 0, 80),
+            mb_substr(trim($detail), 0, 255, 'UTF-8'),
+            samad_client_ip(),
+        ]);
+    } catch (Throwable $e) {}
+}
+
+function samad_log_rate_limit_exceeded(PDO $pdo, string $studentId, ?string $jti, string $endpoint, array $limitResult): void
+{
+    $label = (string)($limitResult['action_label'] ?? $limitResult['action_key'] ?? '');
+    $used = (int)($limitResult['used'] ?? 0);
+    $max = (int)($limitResult['max_count'] ?? 0);
+    $days = (int)($limitResult['window_days'] ?? 1);
+    samad_log_auth_event(
+        $pdo,
+        'rate_limit_exceeded',
+        $studentId,
+        'student',
+        $jti,
+        $endpoint,
+        429,
+        "محدودیت تعداد اکشن دانشجو ({$label}): {$used} از {$max} بار در {$days} روز"
+    );
+}
+
+function samad_get_all_student_action_quotas(PDO $pdo, string $studentId): array
+{
+    $limits = samad_get_student_action_limits($pdo);
+    $quotas = [];
+    foreach ($limits as $key => $cfg) {
+        $quotas[$key] = samad_check_student_rate_limit($pdo, $studentId, $key);
+    }
+    return $quotas;
+}
+

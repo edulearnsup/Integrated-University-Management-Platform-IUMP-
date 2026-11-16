@@ -1227,38 +1227,25 @@
   </div>
 </footer>
 
-<!-- نوار دسترسی سریع ۱-کلیکی ارزیابی پنل‌های سامانه صمد -->
+<!-- نوار دسترسی سریع ۱-کلیکی مدیر ارشد سامانه صمد -->
 <div class="sticky bottom-0 z-40 bg-primary-container/95 backdrop-blur-md border-t border-secondary/30 text-on-primary px-4 py-2.5 shadow-2xl">
   <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2">
     <div class="flex items-center gap-2 text-label-md font-semibold text-secondary-fixed">
       <span class="material-symbols-outlined text-[18px]">bolt</span>
-      <span>دسترسی سریع و تست پنل‌های سامانه صمد:</span>
+      <span>دسترسی سریع مدیر ارشد سامانه صمد:</span>
     </div>
     <div class="flex flex-wrap items-center gap-2">
       <form method="POST" action="login.php" class="inline">
-        <input type="hidden" name="username" value="0011223344">
+        <input type="hidden" name="username" value="Admin">
         <input type="hidden" name="password" value="Admin@12345">
         <input type="hidden" name="captcha" value="8452">
         <button type="submit" class="px-3 py-1.5 rounded bg-secondary text-on-secondary hover:bg-secondary-container hover:text-on-secondary-container text-label-sm font-bold transition-colors cursor-pointer">
-          مدیر واحد نیشابور (دکتر حسینی)
+          ورود مدیر ارشد سامانه (Admin)
         </button>
       </form>
-      <form method="POST" action="login.php" class="inline">
-        <input type="hidden" name="username" value="0099887766">
-        <input type="hidden" name="password" value="Super@12345">
-        <input type="hidden" name="captcha" value="8452">
-        <button type="submit" class="px-3 py-1.5 rounded bg-surface-container-lowest/15 hover:bg-surface-container-lowest/25 text-on-primary text-label-sm font-bold transition-colors cursor-pointer">
-          سرپرست شبانه (مهندس قنبری)
-        </button>
-      </form>
-      <form method="POST" action="login.php" class="inline">
-        <input type="hidden" name="username" value="4012130045">
-        <input type="hidden" name="password" value="Samad@2026!">
-        <input type="hidden" name="captcha" value="8452">
-        <button type="submit" class="px-3 py-1.5 rounded bg-surface-container-lowest/15 hover:bg-surface-container-lowest/25 text-on-primary text-label-sm font-bold transition-colors cursor-pointer">
-          دانشجو (علی رضایی)
-        </button>
-      </form>
+      <a href="login.php" class="px-3 py-1.5 rounded bg-surface-container-lowest/15 hover:bg-surface-container-lowest/25 text-on-primary text-label-sm font-bold transition-colors">
+        صفحه ورود
+      </a>
       <a href="register.php" class="px-3 py-1.5 rounded border border-secondary-fixed/40 text-secondary-fixed hover:bg-secondary-fixed hover:text-on-secondary-fixed text-label-sm font-bold transition-colors">
         ثبت‌نام جدید
       </a>

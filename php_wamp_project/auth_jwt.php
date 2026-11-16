@@ -26,6 +26,13 @@ if ($action === 'session') {
         ]);
     }
 
+    $referer = (string)($_SERVER['HTTP_REFERER'] ?? '');
+    if (($_GET['role'] ?? '') === 'student' || strpos($referer, 'dashboard.php') !== false || strpos($referer, 'role=student') !== false) {
+        $verified = samad_resolve_impersonation_context($pdo, $verified, ['student']);
+    } elseif (($_GET['role'] ?? '') === 'supervisor' || strpos($referer, 'supervisor_panel.php') !== false || strpos($referer, 'role=supervisor') !== false) {
+        $verified = samad_resolve_impersonation_context($pdo, $verified, ['supervisor']);
+    }
+
     samad_send_api_json(200, [
         'authenticated' => true,
         'tokenType' => 'Bearer',
@@ -37,6 +44,7 @@ if ($action === 'session') {
         'iat' => $verified['iat'],
         'exp' => $verified['exp'],
         'permissions' => $verified['permissions'],
+        'isImpersonating' => !empty($verified['is_impersonating']),
     ]);
 }
 
@@ -68,6 +76,7 @@ if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         ($admin['role'] === 'manager' && ($password === 'Admin@12345' || $password === 'manager123')) ||
         ($admin['role'] === 'supervisor' && ($password === 'Super@12345' || $password === 'night123'))
     )) {
+        unset($_SESSION['samad_impersonate_student'], $_SESSION['samad_impersonate_supervisor']);
         $issued = samad_issue_jwt($pdo, (string)$admin['national_id'], (string)$admin['role'], (string)$admin['full_name'], $remember);
         $_SESSION['admin_id'] = $admin['id'];
         $_SESSION['admin_national_id'] = $admin['national_id'];
@@ -94,6 +103,7 @@ if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $student = $stmtStu->fetch(PDO::FETCH_ASSOC);
 
     if ($student && (password_verify($password, $student['password_hash']) || $password === 'Samad@2026!' || $password === 'Student@1234')) {
+        unset($_SESSION['samad_impersonate_student'], $_SESSION['samad_impersonate_supervisor']);
         $issued = samad_issue_jwt($pdo, (string)$student['student_id'], 'student', (string)$student['full_name'], $remember);
         $_SESSION['student_id'] = $student['student_id'];
         $_SESSION['national_id'] = $student['national_id'];
@@ -131,8 +141,24 @@ if ($action === 'refresh' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         ]);
     }
 
+    if (($verified['role'] ?? '') === 'student') {
+        $limRes = samad_check_student_rate_limit($pdo, (string)$verified['sub'], 'auth:jwt:refresh');
+        if (!$limRes['allowed']) {
+            samad_log_rate_limit_exceeded($pdo, (string)$verified['sub'], $verified['jti'] ?? null, 'auth_jwt.php?action=refresh', $limRes);
+            samad_send_api_json(429, [
+                'errorCode' => 'RATE_LIMIT_EXCEEDED',
+                'message' => $limRes['message'],
+                'rateLimit' => $limRes,
+            ]);
+        }
+    }
+
     samad_revoke_jwt($pdo, $verified['jti'], $verified['sub'], 'چرخش خودکار و تمدید توکن');
     $issued = samad_issue_jwt($pdo, $verified['sub'], $verified['role'], $verified['name'], false);
+
+    if (($verified['role'] ?? '') === 'student') {
+        samad_record_student_action($pdo, (string)$verified['sub'], 'auth:jwt:refresh', 'تمدید توکن JWT');
+    }
 
     samad_send_api_json(200, [
         'authenticated' => true,

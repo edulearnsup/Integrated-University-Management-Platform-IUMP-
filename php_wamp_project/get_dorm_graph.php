@@ -445,9 +445,10 @@ try {
     if ($action === 'room_detail') {
         $jwtAuth = samad_require_api_jwt($pdo, ['manager', 'student']);
         $isManagerJwt = ($jwtAuth['role'] === 'manager');
-        $requiredPerm = $isManagerJwt ? 'dorm:graph:view_all' : 'dorm:room:view_self';
-        if (!samad_has_permission($jwtAuth, $requiredPerm)) {
-            samad_log_auth_event($pdo, 'access_denied_403', $jwtAuth['sub'], $jwtAuth['role'], $jwtAuth['jti'], 'get_dorm_graph.php?action=room_detail', 403, "فقدان مجوز {$requiredPerm}");
+        $hasStudentRoomOrGraph = samad_has_permission($jwtAuth, 'dorm:room:view_self') || samad_has_permission($jwtAuth, 'dorm:graph:view_self');
+        if (($isManagerJwt && !samad_has_permission($jwtAuth, 'dorm:graph:view_all')) || (!$isManagerJwt && !$hasStudentRoomOrGraph)) {
+            $missingPerm = $isManagerJwt ? 'dorm:graph:view_all' : 'dorm:graph:view_self';
+            samad_log_auth_event($pdo, 'access_denied_403', $jwtAuth['sub'], $jwtAuth['role'], $jwtAuth['jti'], 'get_dorm_graph.php?action=room_detail', 403, "فقدان مجوز {$missingPerm}");
             send_json(403, [
                 'errorCode' => 'FORBIDDEN_PERMISSION',
                 'message' => 'مجوز مشاهده جزئیات اتاق برای توکن شما فعال نیست.',
@@ -559,9 +560,10 @@ try {
     if ($action === 'student_detail') {
         $jwtAuth = samad_require_api_jwt($pdo, ['manager', 'student']);
         $isManagerJwt = ($jwtAuth['role'] === 'manager');
-        $requiredPerm = $isManagerJwt ? 'dorm:graph:view_all' : 'dorm:room:view_self';
-        if (!samad_has_permission($jwtAuth, $requiredPerm)) {
-            samad_log_auth_event($pdo, 'access_denied_403', $jwtAuth['sub'], $jwtAuth['role'], $jwtAuth['jti'], 'get_dorm_graph.php?action=student_detail', 403, "فقدان مجوز {$requiredPerm}");
+        $hasStudentRoomOrGraph = samad_has_permission($jwtAuth, 'dorm:room:view_self') || samad_has_permission($jwtAuth, 'dorm:graph:view_self');
+        if (($isManagerJwt && !samad_has_permission($jwtAuth, 'dorm:graph:view_all')) || (!$isManagerJwt && !$hasStudentRoomOrGraph)) {
+            $missingPerm = $isManagerJwt ? 'dorm:graph:view_all' : 'dorm:graph:view_self';
+            samad_log_auth_event($pdo, 'access_denied_403', $jwtAuth['sub'], $jwtAuth['role'], $jwtAuth['jti'], 'get_dorm_graph.php?action=student_detail', 403, "فقدان مجوز {$missingPerm}");
             send_json(403, [
                 'errorCode' => 'FORBIDDEN_PERMISSION',
                 'message' => 'مجوز مشاهده اطلاعات دانشجو برای توکن شما فعال نیست.',
@@ -654,6 +656,16 @@ try {
         ]);
     }
 
+    $dormGraphLimit = samad_check_student_rate_limit($pdo, $currentStudentId, 'dorm:graph:view_self');
+    if (!$dormGraphLimit['allowed']) {
+        samad_log_rate_limit_exceeded($pdo, $currentStudentId, $jwtAuth['jti'] ?? null, 'get_dorm_graph.php?action=me', $dormGraphLimit);
+        send_json(429, [
+            'errorCode' => 'RATE_LIMIT_EXCEEDED',
+            'message' => $dormGraphLimit['message'],
+            'rateLimit' => $dormGraphLimit,
+        ]);
+    }
+
     $stmtStudent = $pdo->prepare("
         SELECT `student_id`, `full_name`, `campus`, `field_of_study`, `study_shift`
         FROM `students`
@@ -669,6 +681,8 @@ try {
             'message' => 'پروفایل دانشجو یافت نشد.',
         ]);
     }
+
+    samad_record_student_action($pdo, $currentStudentId, 'dorm:graph:view_self', 'بارگذاری گراف خوابگاه');
 
     $currentStudentBanner = [
         'studentId' => (string)$studentRow['student_id'],

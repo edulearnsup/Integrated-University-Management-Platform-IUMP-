@@ -5,6 +5,9 @@
 -- Encoding: UTF-8 Unicode (utf8mb4)
 -- ==========================================================
 
+SET NAMES utf8mb4;
+SET FOREIGN_KEY_CHECKS = 0;
+
 CREATE DATABASE IF NOT EXISTS `samad_db` CHARACTER SET utf8mb4 COLLATE utf8mb4_persian_ci;
 USE `samad_db`;
 
@@ -23,18 +26,8 @@ CREATE TABLE `admitted_students` (
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
--- داده‌های اولیه نمونه در جدول منبع
-INSERT INTO `admitted_students` (`national_id`, `student_id`, `full_name`, `campus`, `field_of_study`, `is_registered`) VALUES
-('0021487591', '4012130045', 'علی رضایی مقدم', 'پردیس فناوری', 'مهندسی کامپیوتر - هوش مصنوعی و داده', 1),
-('0019845231', '4012130046', 'سارا احمدی', 'پردیس مهارت', 'گرافیک و ارتباط تصویری', 1),
-('0452318974', '4012130047', 'امیرحسین کاظمی', 'پردیس فناوری', 'مهندسی برق - الکترونیک و مخابرات', 1),
-('1278965412', '4012130048', 'زهرا محمدی', 'پردیس مهارت', 'معماری و دکوراسیون داخلی', 1),
-('0032541896', '4012130049', 'مهدی صادقی', 'پردیس فناوری', 'مهندسی صنایع و مدیریت سیستم', 1),
-('0041258963', '4012130050', 'رضا باقری', 'پردیس فناوری', 'مهندسی مکانیک و مکاترونیک', 1),
-('0078965412', '4012130051', 'نیما حسینی', 'پردیس مهارت', 'تکنولوژی طراحی و ساخت', 1),
-('0055443322', '4012130070', 'سینا محمدپور (داوطلب قبولی جدید)', 'پردیس فناوری', 'مهندسی کامپیوتر - شبکه', 0),
-('0066554433', '4012130071', 'مریم شفیعی (داوطلب قبولی جدید)', 'پردیس مهارت', 'طراحی لباس و پارچه', 0),
-('0077665544', '4012130072', 'پرهام رفیعی (داوطلب قبولی جدید)', 'پردیس فناوری', 'مکاترونیک و اتوماسیون صنعتی', 0);
+-- جدول منبع پذیرفته‌شدگان بدون داده نمونه (آماده ورود اطلاعات واقعی)
+
 
 -- ----------------------------------------------------------
 -- ۲. جدول اصلی دانشجویان ثبت‌نام شده
@@ -58,37 +51,15 @@ CREATE TABLE `students` (
   `dormitory_note` TEXT DEFAULT NULL,
   `photo_path` VARCHAR(255) DEFAULT NULL,
   `password_hash` VARCHAR(255) NOT NULL,
+  `wallet_balance` BIGINT NOT NULL DEFAULT 250000 COMMENT 'موجودی کیف پول الکترونیک به ریال',
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   INDEX `idx_national_id` (`national_id`),
   INDEX `idx_student_id` (`student_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
--- دانشجویان ثبت‌نام شده اولیه برای تست پنل‌ها (رمز همه: Samad@2026!)
-INSERT INTO `students` (`national_id`, `student_id`, `full_name`, `mobile`, `campus`, `field_of_study`, `study_shift`, `province`, `city`, `residential_address`, `request_dormitory`, `password_hash`) VALUES
-('0021487591', '4012130045', 'علی رضایی مقدم', '09121234567', 'پردیس فناوری', 'مهندسی کامپیوتر - هوش مصنوعی و داده', 'روزانه', 'اصفهان', 'کاشان', 'کاشان خیابان شهید بهشتی', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0019845231', '4012130046', 'سارا احمدی', '09129876543', 'پردیس مهارت', 'گرافیک و ارتباط تصویری', 'روزانه', 'فارس', 'شیراز', 'شیراز معالی آباد', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0452318974', '4012130047', 'امیرحسین کاظمی', '09351239988', 'پردیس فناوری', 'مهندسی برق - الکترونیک و مخابرات', 'روزانه', 'خراسان رضوی', 'مشهد', 'مشهد احمدآباد', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('1278965412', '4012130048', 'زهرا محمدی', '09135554433', 'پردیس مهارت', 'معماری و دکوراسیون داخلی', 'شبانه (نوبت دوم)', 'یزد', 'یزد', 'یزد میدان امیرچخماق', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0032541896', '4012130049', 'مهدی صادقی', '09194443322', 'پردیس فناوری', 'مهندسی صنایع و مدیریت سیستم', 'روزانه', 'آذربایجان شرقی', 'تبریز', 'تبریز آبرسان', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0041258963', '4012130050', 'رضا باقری', '09127778899', 'پردیس فناوری', 'مهندسی مکانیک و مکاترونیک', 'روزانه', 'گیلان', 'رشت', 'رشت گلسار', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0078965412', '4012130051', 'نیما حسینی', '09381112233', 'پردیس مهارت', 'تکنولوژی ساخت', 'روزانه', 'مازندران', 'ساری', 'ساری خ فرهنگ', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
--- دانشجویان سناریوی اتاق ۱۰۰ با ظرفیت ۱۰ و اسکان ۱۳ نفر (شامل مازاد بر ظرفیت)
-('0081234567', '4012130052', 'آرمین شجاعی', '09120000001', 'پردیس فناوری', 'مهندسی کامپیوتر', 'روزانه', 'البرز', 'کرج', 'کرج عظیمیه', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234568', '4012130053', 'پارسا یوسفی', '09120000002', 'پردیس فناوری', 'مهندسی برق', 'روزانه', 'خوزستان', 'اهواز', 'اهواز کیانپارس', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234569', '4012130054', 'سینا فلاحی', '09120000003', 'پردیس فناوری', 'مهندسی صنایع', 'روزانه', 'کرمان', 'کرمان', 'کرمان میدان آزادی', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234570', '4012130055', 'پویا عباسی', '09120000004', 'پردیس فناوری', 'مهندسی مکانیک', 'روزانه', 'همدان', 'همدان', 'همدان بوعلی', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234571', '4012130056', 'کیان منصوری', '09120000005', 'پردیس فناوری', 'مهندسی عمران', 'روزانه', 'مرکزی', 'اراک', 'اراک خیابان دانشگاه', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234572', '4012130057', 'دانیال کریمی', '09120000006', 'پردیس فناوری', 'مهندسی مواد', 'روزانه', 'زنجان', 'زنجان', 'زنجان سعدی', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234573', '4012130058', 'شایان دهقان', '09120000007', 'پردیس فناوری', 'مهندسی شیمی', 'روزانه', 'قم', 'قم', 'قم صفاییه', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234574', '4012130059', 'عرفان ابراهیمی', '09120000008', 'پردیس فناوری', 'مهندسی کامپیوتر', 'روزانه', 'لرستان', 'خرم‌آباد', 'خرم‌آباد علوی', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234575', '4012130060', 'سروش نظری', '09120000009', 'پردیس فناوری', 'مهندسی نفت', 'روزانه', 'کرمانشاه', 'کرمانشاه', 'کرمانشاه نوبهار', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234576', '4012130061', 'برنا رادمنش (روزانه مازاد)', '09120000010', 'پردیس فناوری', 'مهندسی کامپیوتر', 'روزانه', 'سمنان', 'سمنان', 'سمنان دانشگاه', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234577', '4012130062', 'فرزاد محمودی (دانشجوی میهمان)', '09120000011', 'پردیس مهارت', 'معماری داخلی', 'روزانه', 'یزد', 'یزد', 'یزد صفائیه', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0081234578', '4012130063', 'نوید صالحی (دانشجوی شبانه)', '09120000012', 'پردیس فناوری', 'مهندسی مکانیک', 'شبانه (نوبت دوم)', 'قزوین', 'قزوین', 'قزوین دانشگاه', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0091234561', '4012130081', 'امیررضا کریمی (در انتظار اسکان)', '09351112233', 'پردیس فناوری', 'مهندسی کامپیوتر', 'روزانه', 'آذربایجان شرقی', 'تبریز', 'تبریز، میدان آبرسان', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0091234562', '4012130082', 'محمدحسین نوری (متقاضی میهمانی)', '09362223344', 'پردیس مهارت', 'گرافیک و انیمیشن', 'روزانه', 'اصفهان', 'کاشان', 'کاشان، خیابان امیرکبیر', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6'),
-('0091234563', '4012130083', 'سجاد موسوی (در انتظار اسکان)', '09373334455', 'پردیس فناوری', 'مهندسی برق صنعتی', 'شبانه (نوبت دوم)', 'خوزستان', 'دزفول', 'دزفول، خیابان شریعتی', 1, '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6');
+-- جدول دانشجویان ثبت‌نام‌شده بدون داده نمونه
+
 
 -- ----------------------------------------------------------
 -- ۳. جدول مهارت‌های دانشجو
@@ -102,10 +73,7 @@ CREATE TABLE `student_skills` (
   FOREIGN KEY (`student_id`) REFERENCES `students` (`student_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `student_skills` (`student_id`, `skill_name`) VALUES
-('4012130045', 'پایتون (Python)'),
-('4012130045', 'هوش مصنوعی'),
-('4012130047', 'طراحی مدار الکترونیک');
+
 
 -- ----------------------------------------------------------
 -- ۴. جدول علاقه‌مندی دانشجو در جشنواره‌ها
@@ -120,10 +88,7 @@ CREATE TABLE `student_festivals` (
   FOREIGN KEY (`student_id`) REFERENCES `students` (`student_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `student_festivals` (`student_id`, `festival_key`, `festival_title`) VALUES
-('4012130045', 'technical', 'جشنواره‌ها و المپیادهای فنی و اختراعات'),
-('4012130045', 'robotics', 'مسابقات رباتیک و هوش مصنوعی'),
-('4012130045', 'sports', 'جشنواره‌های ورزشی و مسابقات پردیس');
+
 
 -- ----------------------------------------------------------
 -- ۴.۱. جدول تیم‌های ورزشی ثبت‌نامی دانشجو
@@ -137,9 +102,7 @@ CREATE TABLE `student_sports_teams` (
   FOREIGN KEY (`student_id`) REFERENCES `students` (`student_id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `student_sports_teams` (`student_id`, `team_name`) VALUES
-('4012130045', 'تیم فوتبال دانشگاه'),
-('4012130045', 'والیبال');
+
 
 -- ----------------------------------------------------------
 -- ۴.۲. جدول فراخوان‌ها و اطلاعیه‌های هدفمند جشنواره‌ها (صادرشده توسط مدیر)
@@ -150,16 +113,16 @@ CREATE TABLE `festival_calls` (
   `title` VARCHAR(255) NOT NULL,
   `target_category` ENUM('all', 'sports', 'religious', 'robotics', 'cultural', 'technical', 'skillBased') NOT NULL DEFAULT 'all',
   `target_sports_team` VARCHAR(100) DEFAULT NULL,
+  `target_skill` VARCHAR(100) DEFAULT NULL,
   `content` TEXT NOT NULL,
-  `deadline_date` VARCHAR(30) NOT NULL,
+  `start_date` VARCHAR(30) DEFAULT NULL COMMENT 'تاریخ شروع بازه فراخوان',
+  `deadline_date` VARCHAR(30) NOT NULL COMMENT 'تاریخ و مهلت پایان فراخوان',
   `issued_by` VARCHAR(150) NOT NULL,
+  `is_active` TINYINT(1) DEFAULT 1,
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `festival_calls` (`title`, `target_category`, `target_sports_team`, `content`, `deadline_date`, `issued_by`) VALUES
-('فراخوان انتخابی تیم فوتبال دانشجویان برای المپیاد کشوری', 'sports', 'تیم فوتبال دانشگاه', 'از کلیه دانشجویان عضو تیم فوتبال دعوت می‌شود روز سه‌شنبه ساعت ۱۷ جهت تمرین انتخابی در زمین چمن پردیس حضور به هم رسانند.', '۱۴۰۳/۰۸/۱۰', 'مدیریت تربیت بدنی و امور خوابگاه‌ها'),
-('ثبت‌نام مسابقات سراسری قرآن و عترت و تواشیح دانشگاهیان', 'religious', NULL, 'کلیه دانشجویان علاقه‌مند به جشنواره‌های مذهبی و قرآنی می‌توانند جهت ثبت‌نام به دفتر نهاد رهبری مراجعه فرمایند.', '۱۴۰۳/۰۸/۱۵', 'معاونت فرهنگی و دانشجویی'),
-('آغاز اردوی تدارکاتی تیم والیبال پردیس', 'sports', 'والیبال', 'تمرینات فشرده تیم والیبال دانشگاه جهت اعزام به لیگ بین‌دانشگاهی از هفته آینده آغاز می‌گردد.', '۱۴۰۳/۰۸/۰۵', 'کمیته ورزش خوابگاه صمد');
+
 
 -- ==========================================================
 -- جداول جدید مدیریت خوابگاه و سرپرستی (مدیر دانشگاه و سرپرست خوابگاه)
@@ -172,21 +135,20 @@ INSERT INTO `festival_calls` (`title`, `target_category`, `target_sports_team`, 
 DROP TABLE IF EXISTS `admins`;
 CREATE TABLE `admins` (
   `id` INT AUTO_INCREMENT PRIMARY KEY,
-  `national_id` VARCHAR(10) NOT NULL UNIQUE COMMENT 'کد ملی ادمین جهت ورود',
+  `national_id` VARCHAR(30) NOT NULL UNIQUE COMMENT 'شناسه یا کد ملی ادمین جهت ورود',
   `password_hash` VARCHAR(255) NOT NULL COMMENT 'کلمه عبور هش شده یا مستقیم',
   `full_name` VARCHAR(150) NOT NULL COMMENT 'نام و سمت',
   `role` ENUM('manager', 'supervisor') NOT NULL COMMENT 'manager: مدیر دانشگاه | supervisor: سرپرست خوابگاه',
+  `created_by_national_id` VARCHAR(30) DEFAULT NULL COMMENT 'شناسه مدیر ایجادکننده کاربر',
   `shift_hours` VARCHAR(150) DEFAULT '۲۲:۰۰ الی ۰۶:۰۰ (شیفت شب)',
   `shift_days` VARCHAR(150) DEFAULT 'شنبه تا چهارشنبه',
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
--- ثبت اطلاعات ادمین‌ها در دیتابیس:
--- ۱. مدیر دانشگاه: کدملی: 0011223344 / رمز: Admin@12345
--- ۲. سرپرست خوابگاه: کدملی: 0099887766 / رمز: Super@12345
+-- ثبت صرفاً یک کاربر ادمین ارشد پایه سامانه:
+-- نام کاربری: Admin / رمز: Admin@12345
 INSERT INTO `admins` (`national_id`, `password_hash`, `full_name`, `role`) VALUES
-('0011223344', '$2y$10$w3U6R3e.w4/cK/K0b.kQMe3fK3C9/E1rF3B5H7L9j1N3P5R7T9V1a', 'دکتر علیرضا حسینی (مدیر دانشگاه و امور رفاهی)', 'manager'),
-('0099887766', '$2y$10$w3U6R3e.w4/cK/K0b.kQMe3fK3C9/E1rF3B5H7L9j1N3P5R7T9V1a', 'مهندس کامران قنبری (سرپرست شبانه خوابگاه صمد)', 'supervisor');
+('Admin', '$2y$10$r9xL0mN2pQ4sT6vW8yZ0aO1bC3dE5fG7hI9jK1lM3nO5pQ7rS9tU2', 'مدیر ارشد سامانه (Admin)', 'manager');
 
 -- ----------------------------------------------------------
 -- ۶. جدول اتاق‌های خوابگاه (ساختمان در طبقات همکف، اول و دوم)
@@ -203,23 +165,8 @@ CREATE TABLE `dorm_rooms` (
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
--- نمونه اتاق‌های خوابگاه در سه طبقه (همکف، طبقه اول، طبقه دوم)
-INSERT INTO `dorm_rooms` (`id`, `room_number`, `floor`, `capacity`, `is_active`, `is_completed`, `description`) VALUES
--- طبقه همکف
-(1, 'G01', 'همکف', 4, 1, 1, 'اتاق ۴ تخته مجهز به یخچال - طبقه همکف'),
-(2, 'G02', 'همکف', 4, 1, 1, 'اتاق ۴ تخته نورگیر - طبقه همکف'),
-(3, 'G03', 'همکف', 4, 0, 0, 'اتاق در دست نقاشی و نوسازی تاسیسات (تکمیل‌نشده)'),
--- طبقه اول
-(4, '100', 'طبقه اول', 10, 1, 1, 'اتاق نمونه ۱۰ نفره با ۱۳ اسکان‌یافته (شامل پذیرش مازاد بر ظرفیت)'),
-(5, '101', 'طبقه اول', 4, 1, 1, 'اتاق ۴ تخته بالکن‌دار - طبقه اول'),
-(6, '102', 'طبقه اول', 4, 1, 1, 'اتاق ۴ تخته ساکت و مناسب مطالعه - طبقه اول'),
-(7, '103', 'طبقه اول', 6, 1, 1, 'اتاق ۶ تخته بزرگ ویژه نخبگان مهارتی - طبقه اول'),
-(8, '104', 'طبقه اول', 4, 1, 0, 'اتاق ۴ تخته رو به حیاط پردیس (تکمیل‌نشده)'),
--- طبقه دوم
-(9, '201', 'طبقه دوم', 4, 1, 1, 'اتاق ۴ تخته مجهز به سیستم تهویه - طبقه دوم'),
-(10, '202', 'طبقه دوم', 4, 1, 1, 'اتاق ۴ تخته - طبقه دوم'),
-(11, '203', 'طبقه دوم', 4, 0, 0, 'اتاق نیازمند تعمیرات سرمایشی (غیرفعال)'),
-(12, '204', 'طبقه دوم', 4, 1, 0, 'اتاق ۴ تخته انتهای راهرو - در انتظار تکمیل اطلاعات');
+-- جدول اتاق‌های خوابگاه بدون داده نمونه
+
 
 -- ----------------------------------------------------------
 -- ۶.۱. جدول موجودیت امکانات اتاق خوابگاه (امکانات اصلی و فرعی)
@@ -231,23 +178,28 @@ CREATE TABLE `room_facilities` (
   `room_number` VARCHAR(10) NOT NULL,
   `floor` ENUM('همکف', 'طبقه اول', 'طبقه دوم') NOT NULL,
   `refrigerator` VARCHAR(100) NOT NULL DEFAULT 'یخچال ۶ فوت استاندارد (سالم)',
+  `fridge_model` VARCHAR(100) DEFAULT 'یخچال ۶ فوت امرسان',
   `wardrobe` VARCHAR(100) NOT NULL DEFAULT 'کمد ۴ درب اختصاصی دانشجویان (سالم)',
   `carpet` VARCHAR(100) NOT NULL DEFAULT 'فرش ۶ متری ماشینی (سالم)',
+  `bed_type` VARCHAR(100) DEFAULT 'تخت فلزی دو طبقه استاندارد',
+  `ac_heater` VARCHAR(100) DEFAULT 'شوفاژ مرکزی + کولر آبی',
+  `tv_model` VARCHAR(100) DEFAULT NULL,
+  `has_broom` TINYINT(1) DEFAULT 1,
+  `has_trash_bin` TINYINT(1) DEFAULT 1,
+  `has_bucket` TINYINT(1) DEFAULT 1,
+  `has_carpet` TINYINT(1) DEFAULT 1,
+  `has_wardrobe` TINYINT(1) DEFAULT 1,
+  `has_desk` TINYINT(1) DEFAULT 0,
+  `has_shoe_rack` TINYINT(1) DEFAULT 1,
+  `has_mirror` TINYINT(1) DEFAULT 1,
   `secondary_facilities` TEXT DEFAULT NULL COMMENT 'JSON یا متن امکانات فرعی مثل سطل آشغال، جارو، پرده، تلویزیون، اسپلیت...',
+  `notes` TEXT DEFAULT NULL,
   `status` ENUM('تکمیل‌شده', 'در انتظار تکمیل') NOT NULL DEFAULT 'در انتظار تکمیل',
   `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   FOREIGN KEY (`room_id`) REFERENCES `dorm_rooms` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `room_facilities` (`room_id`, `room_number`, `floor`, `refrigerator`, `wardrobe`, `carpet`, `secondary_facilities`, `status`) VALUES
-(1, 'G01', 'همکف', 'یخچال ۶ فوت امرسان', 'کمد ۴ درب چوبی', 'فرش ۶ متری ۱۲۰۰ شانه', '[{"name":"سطل زباله پدالی","count":1,"condition":"سالم"},{"name":"جارو نپتون و خاک‌انداز","count":1,"condition":"سالم"},{"name":"پرده حریر","count":2,"condition":"سالم"}]', 'تکمیل‌شده'),
-(2, 'G02', 'همکف', 'یخچال ۵ فوت ایستکول', 'کمد ۴ درب فلزی', 'فرش ۶ متری ۷۰۰ شانه', '[{"name":"سطل زباله","count":1,"condition":"سالم"},{"name":"جارو دستی","count":1,"condition":"سالم"}]', 'تکمیل‌شده'),
-(4, '100', 'طبقه اول', 'یخچال دوقلو ۱۲ فوت بزرگ ویژه اتاق ۱۰ نفره', 'کمد ۱۰ درب تفکیکی جادار', '۲ تخته فرش ۹ متری کاشان', '[{"name":"تلویزیون ۴۳ اینچ ال‌ای‌دی","count":1,"condition":"سالم"},{"name":"اسپلیت ۲۴ هزار ال‌جی","count":1,"condition":"سالم"},{"name":"سطل زباله بزرگ اداری","count":2,"condition":"سالم"},{"name":"جاروبرقی سطلی پردیس","count":1,"condition":"سالم"},{"name":"جاکفشی طبقاتی راهرو","count":1,"condition":"سالم"}]', 'تکمیل‌شده'),
-(5, '101', 'طبقه اول', 'یخچال ۷ فوت اسنوا', 'کمد ۴ درب اختصاصی', 'فرش ۶ متری طرح افشان', '[{"name":"سطل زباله","count":1,"condition":"سالم"},{"name":"جارو نپتون","count":1,"condition":"سالم"},{"name":"بند رخت بالکن","count":1,"condition":"سالم"}]', 'تکمیل‌شده'),
-(6, '102', 'طبقه اول', 'یخچال ۵ فوت فیلور', 'کمد ۴ درب چوبی', 'فرش ۶ متری مشهد', '[{"name":"سطل زباله فلزی","count":1,"condition":"سالم"},{"name":"چراغ مطالعه رومیزی","count":2,"condition":"سالم"}]', 'تکمیل‌شده'),
-(7, '103', 'طبقه اول', 'یخچال ۹ فوت دونار', 'کمد ۶ درب ام‌دی‌اف نخبگان', 'فرش ۹ متری تبریز', '[{"name":"سطل زباله","count":1,"condition":"سالم"},{"name":"پرده زبرا","count":2,"condition":"سالم"}]', 'تکمیل‌شده'),
-(9, '201', 'طبقه دوم', 'یخچال ۶ فوت امرسان', 'کمد ۴ درب', 'فرش ۶ متری', '[{"name":"سطل زباله","count":1,"condition":"سالم"},{"name":"اسپلیت سرمایشی","count":1,"condition":"سالم"}]', 'تکمیل‌شده'),
-(10, '202', 'طبقه دوم', 'یخچال ۶ فوت هیمالیا', 'کمد ۴ درب', 'فرش ۶ متری', '[{"name":"سطل زباله","count":1,"condition":"سالم"}]', 'تکمیل‌شده');
+
 
 -- ----------------------------------------------------------
 -- ۷. جدول تخصیص اتاق به دانشجویان و وضعیت خوابگاه (میهمان، دارای شهریه، بدون شهریه)
@@ -263,6 +215,8 @@ CREATE TABLE `dorm_allocations` (
   `is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT 'وضعیت سکونت جاری',
   `guest_days_total` INT DEFAULT NULL COMMENT 'تعداد کل روزهای مجاز اقامت میهمانی',
   `guest_days_remaining` INT DEFAULT NULL COMMENT 'تعداد روزهای باقی‌مانده از اقامت میهمانی',
+  `guest_start_date` DATE DEFAULT NULL COMMENT 'تاریخ شروع اقامت میهمان',
+  `guest_end_date` DATE DEFAULT NULL COMMENT 'تاریخ پایان اقامت میهمان',
   `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (`student_id`) REFERENCES `students` (`student_id`) ON DELETE CASCADE,
   FOREIGN KEY (`room_id`) REFERENCES `dorm_rooms` (`id`) ON DELETE CASCADE,
@@ -270,34 +224,8 @@ CREATE TABLE `dorm_allocations` (
   INDEX `idx_alloc_student` (`student_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
--- تخصیص دانشجویان نمونه به اتاق‌ها
-INSERT INTO `dorm_allocations` (`student_id`, `room_id`, `dorm_status`, `allocation_date`, `is_active`, `guest_days_total`, `guest_days_remaining`, `created_at`) VALUES
-('4012130045', 5, 'بدون شهریه', '2026-09-20', 1, NULL, NULL, '2026-09-20 08:00:00'),
-('4012130047', 5, 'دارای شهریه', '2026-09-20', 1, NULL, NULL, '2026-09-20 08:30:00'),
-('4012130049', 6, 'میهمان', '2026-09-22', 1, 7, 4, '2026-09-22 09:00:00'),
-('4012130050', 1, 'بدون شهریه', '2026-09-21', 1, NULL, NULL, '2026-09-21 10:00:00'),
-('4012130046', 9, 'بدون شهریه', '2026-09-21', 1, NULL, NULL, '2026-09-21 10:30:00'),
-('4012130048', 10, 'دارای شهریه', '2026-09-21', 1, NULL, NULL, '2026-09-21 11:00:00'),
+-- جدول تخصیص اتاق بدون داده نمونه
 
--- تخصیص سناریوی درخواست کاربر: اتاق ۱۰۰ با ظرفیت ۱۰ تخت و ۱۳ دانشجو
--- ۱۰ دانشجوی اول روزانه دارای تخت مصوب (به ترتیب زمان اسکان):
-('4012130051', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 08:00:00'),
-('4012130052', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 08:15:00'),
-('4012130053', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 08:30:00'),
-('4012130054', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 08:45:00'),
-('4012130055', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 09:00:00'),
-('4012130056', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 09:15:00'),
-('4012130057', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 09:30:00'),
-('4012130058', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 09:45:00'),
-('4012130059', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 10:00:00'),
-('4012130060', 4, 'بدون شهریه', '2026-09-10', 1, NULL, NULL, '2026-09-10 10:15:00'),
--- ۳ دانشجوی مازاد بر ظرفیت:
--- ۱. دانشجوی روزانه مازاد (اسکان‌یافته پس از تکمیل ظرفیت تخت‌ها با تاریخ دیرتر):
-('4012130061', 4, 'بدون شهریه', '2026-09-15', 1, NULL, NULL, '2026-09-15 11:00:00'),
--- ۲. دانشجوی میهمان مازاد:
-('4012130062', 4, 'میهمان', '2026-09-16', 1, 10, 8, '2026-09-16 12:00:00'),
--- ۳. دانشجوی شبانه مازاد:
-('4012130063', 4, 'دارای شهریه', '2026-09-17', 1, NULL, NULL, '2026-09-17 14:00:00');
 
 -- ----------------------------------------------------------
 -- ۸. جدول سرشماری شبانه خوابگاه (توسط سرپرست خوابگاه)
@@ -317,11 +245,7 @@ CREATE TABLE `dorm_night_attendance` (
   FOREIGN KEY (`room_id`) REFERENCES `dorm_rooms` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `dorm_night_attendance` (`student_id`, `room_id`, `attendance_date`, `status`, `supervisor_national_id`, `notes`) VALUES
-('4012130045', 5, CURDATE(), 'حاضر', '0099887766', 'سرشماری ساعت ۲۲:۳۰ - حضور در اتاق تایید شد'),
-('4012130047', 5, CURDATE(), 'غایب', '0099887766', 'بدون برگه تردد شبانه تا ساعت ۲۳ حاضر نشد'),
-('4012130049', 6, CURDATE(), 'مرخصی', '0099887766', 'دارای برگه مرخصی پایان هفته با تایید سرپرستی'),
-('4012130050', 1, CURDATE(), 'حاضر', '0099887766', 'حاضر در اتاق G01 همکف');
+
 
 -- ----------------------------------------------------------
 -- ۹. جدول اطلاع‌رسانی خرابی و درخواست تعمیر/تعویض تجهیزات خوابگاه
@@ -336,15 +260,16 @@ CREATE TABLE `maintenance_reports` (
   `equipment_name` VARCHAR(150) NOT NULL COMMENT 'نام قطعه یا تجهیز (یخچال، کمد، فرش، تخت، شوفاژ، تلویزیون، اسپلیت...)',
   `maintenance_type` ENUM('تعمیر', 'تعویض / خرید جدید') NOT NULL DEFAULT 'تعمیر',
   `urgency` ENUM('فوری', 'عادی', 'کم‌اهمیت') NOT NULL DEFAULT 'عادی',
-  `status` ENUM('در انتظار اقدام', 'در حال تعمیر', 'رفع‌شده / تعمیر شد', 'رفع‌شده / خریداری و تعویض شد') NOT NULL DEFAULT 'در انتظار اقدام',
+  `status` VARCHAR(100) NOT NULL DEFAULT 'در انتظار اقدام',
   `description` TEXT NOT NULL COMMENT 'شرح خرابی ثبت‌شده توسط سرپرست',
   `reported_by_supervisor_id` VARCHAR(20) NOT NULL COMMENT 'کد سرپرست گزارش‌کننده',
   `reported_by_supervisor_name` VARCHAR(150) NOT NULL COMMENT 'نام سرپرست گزارش‌کننده',
   `reported_at` VARCHAR(50) NOT NULL COMMENT 'تاریخ و زمان دقیق ثبت گزارش خرابی',
   `resolved_at` VARCHAR(50) DEFAULT NULL COMMENT 'تاریخ و زمان رفع عیب توسط مدیر',
   `resolved_by_manager_name` VARCHAR(150) DEFAULT NULL COMMENT 'نام مدیر رفع‌کننده اشکال',
-  `resolution_action` ENUM('تعمیر قطعه', 'خرید و جایگزینی تجهیز نو') DEFAULT NULL,
-  `resolution_cost` INT DEFAULT NULL COMMENT 'هزینه انجام شده به ریال',
+  `resolution_action` VARCHAR(100) DEFAULT NULL,
+  `resolution_cost` BIGINT DEFAULT NULL COMMENT 'هزینه انجام شده به ریال',
+  `cost_rials` BIGINT DEFAULT NULL COMMENT 'هزینه پرداختی به ریال',
   `invoice_number` VARCHAR(50) DEFAULT NULL COMMENT 'شماره فاکتور مالی رسمی',
   `contractor_or_store_name` VARCHAR(150) DEFAULT NULL COMMENT 'فروشگاه یا پیمانکار طرف حساب',
   `resolution_notes` TEXT DEFAULT NULL COMMENT 'توضیحات و گزارش فاکتور مدیر',
@@ -352,13 +277,7 @@ CREATE TABLE `maintenance_reports` (
   FOREIGN KEY (`room_id`) REFERENCES `dorm_rooms` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `maintenance_reports` (`room_id`, `room_number`, `floor`, `equipment_name`, `maintenance_type`, `urgency`, `status`, `description`, `reported_by_supervisor_id`, `reported_by_supervisor_name`, `reported_at`, `resolved_at`, `resolved_by_manager_name`, `resolution_action`, `resolution_cost`, `invoice_number`, `contractor_or_store_name`, `resolution_notes`) VALUES
-(4, '100', 'طبقه اول', 'تخت طبقه دوم شماره ۳', 'تعمیر', 'فوری', 'در انتظار اقدام', 'جوش پایه نردبان تخت فلزی شل شده و برای بالا رفتن دانشجو خطرآفرین است.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۱۵ - ۲۲:۱۵', NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-(5, '101', 'طبقه اول', 'دستگیره پنجره بالکن', 'تعمیر', 'عادی', 'در انتظار اقدام', 'دستگیره دوجداره لق شده و به درستی قفل نمی‌شود.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۱۴ - ۲۲:۳۰', NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-(9, '201', 'طبقه دوم', 'رادیاتور شوفاژ اتاق', 'تعمیر', 'فوری', 'در حال تعمیر', 'نشتی جزئی آب از شیر رفت شوفاژ؛ نیازمند آچارکشی و تعویض واشر.', 'SUP-405-02', 'حسین مرادی', '۱۴۰۳/۰۷/۱۴ - ۲۲:۴۵', NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-(1, 'G01', 'همکف', 'ترموستات یخچال امرسان', 'تعمیر', 'عادی', 'رفع‌شده / تعمیر شد', 'موتور یخچال یکسره کار می‌کرد و دمای داخل بیش از حد سرد بود.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۱۰ - ۲۱:۰۰', '۱۴۰۳/۰۷/۱۱ - ۱۰:۳۰', 'دکتر علیرضا حسینی (مدیر امور رفاهی)', 'تعمیر قطعه', 3500000, 'INV-1403-1001', 'تعمیرگاه مجاز لوازم خانگی پردیس', 'سرویسکار مجاز فراخوانده شد و رله استارت و ترموستات تنظیم و تعویض گردید.'),
-(6, '102', 'طبقه اول', 'قفل درب کمد دیواری', 'تعمیر', 'عادی', 'رفع‌شده / تعمیر شد', 'مغزی قفل کمد گیر کرده بود و کلید نمی‌چرخید.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۰۸ - ۲۳:۰۰', '۱۴۰۳/۰۷/۰۹ - ۱۱:۰۰', 'دکتر علیرضا حسینی (مدیر امور رفاهی)', 'تعمیر قطعه', 1800000, 'INV-1403-1002', 'ابزار و یراق پردیس مرکزی', 'مغزی قفل کمد تعویض و کلید جدید به سرپرست تحویل شد.'),
-(7, '103', 'طبقه اول', 'مهتابی ال‌ای‌دی سقف', 'تعویض / خرید جدید', 'عادی', 'رفع‌شده / خریداری و تعویض شد', 'ترانس لامپ مهتابی سوخته بود و روشنایی کافی نداشت.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۰۵ - ۲۲:۰۰', '۱۴۰۳/۰۷/۰۶ - ۰۹:۳۰', 'دکتر علیرضا حسینی (مدیر امور رفاهی)', 'خرید و جایگزینی تجهیز نو', 2400000, 'INV-1403-1003', 'کالای برق و روشنایی نوین', 'پنل ال‌ای‌دی ۶۰ در ۶۰ پرنور نو نصب و جایگزین گردید.');
+
 
 -- ----------------------------------------------------------
 -- ۱۰. جدول ارزیابی شبانه نظافت خوابگاه‌ها (۴ سطحی: عالی، خوب، متوسط، ضعیف)
@@ -380,52 +299,9 @@ CREATE TABLE `room_cleanliness_records` (
   FOREIGN KEY (`room_id`) REFERENCES `dorm_rooms` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `room_cleanliness_records` (`room_id`, `room_number`, `floor`, `inspection_date`, `grade`, `supervisor_national_id`, `supervisor_name`, `notes`, `recorded_at`) VALUES
--- ارزیابی‌های تاریخ ۱۴۰۳/۰۷/۱۴
-(4, '100', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'عالی', '0099887766', 'مهندس کامران قنبری', 'نظافت استثنایی اتاق ۱۰ نفره، کف بسیار تمیز و مرتب، تهویه عالی', '۱۴۰۳/۰۷/۱۴ - ۲۳:۳۰'),
-(5, '101', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'عالی', '0099887766', 'مهندس کامران قنبری', 'تخت‌های مرتب و آنکادر، یخچال بسیار پاکیزه', '۱۴۰۳/۰۷/۱۴ - ۲۳:۳۵'),
-(6, '102', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'خوب', '0099887766', 'مهندس کامران قنبری', 'مرتب و منظم، میز مطالعه کمی شلوغ', '۱۴۰۳/۰۷/۱۴ - ۲۳:۴۰'),
-(7, '103', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'عالی', '0099887766', 'مهندس کامران قنبری', 'اتاق نخبگان بسیار منضبط و پاکیزه', '۱۴۰۳/۰۷/۱۴ - ۲۳:۴۵'),
-(9, '201', 'طبقه دوم', '۱۴۰۳/۰۷/۱۴', 'متوسط', '0099887766', 'مهندس کامران قنبری', 'نیاز به شستشوی ظروف سینک و جمع‌آوری لباس‌ها', '۱۴۰۳/۰۷/۱۴ - ۲۳:۵۰'),
-(10, '202', 'طبقه دوم', '۱۴۰۳/۰۷/۱۴', 'ضعیف', '0099887766', 'مهندس کامران قنبری', 'انباشت زباله در سطل، تذکر کتبی به ساکنین اتاق داده شد', '۱۴۰۳/۰۷/۱۴ - ۲۳:۵۵'),
-(1, 'G01', 'همکف', '۱۴۰۳/۰۷/۱۴', 'خوب', '0099887766', 'مهندس کامران قنبری', 'کف تی کشیده شده و اتاق آماده است', '۱۴۰۳/۰۷/۱۵ - ۰۰:۰۰'),
--- ارزیابی‌های تاریخ ۱۴۰۳/۰۷/۱۳
-(4, '100', 'طبقه اول', '۱۴۰۳/۰۷/۱۳', 'عالی', '0099887766', 'مهندس کامران قنبری', 'چیدمان فوق‌العاده و تمیز', '۱۴۰۳/۰۷/۱۳ - ۲۳:۳۰'),
-(5, '101', 'طبقه اول', '۱۴۰۳/۰۷/۱۳', 'عالی', '0099887766', 'مهندس کامران قنبری', 'بسیار تمیز', '۱۴۰۳/۰۷/۱۳ - ۲۳:۳۵'),
-(6, '102', 'طبقه اول', '۱۴۰۳/۰۷/۱۳', 'خوب', '0099887766', 'مهندس کامران قنبری', 'خوب و بدون مشکل', '۱۴۰۳/۰۷/۱۳ - ۲۳:۴۰'),
-(7, '103', 'طبقه اول', '۱۴۰۳/۰۷/۱۳', 'عالی', '0099887766', 'مهندس کامران قنبری', 'عالی', '۱۴۰۳/۰۷/۱۳ - ۲۳:۴۵'),
-(9, '201', 'طبقه دوم', '۱۴۰۳/۰۷/۱۳', 'خوب', '0099887766', 'مهندس کامران قنبری', 'بهبود نسبت به قبل', '۱۴۰۳/۰۷/۱۳ - ۲۳:۵۰'),
-(10, '202', 'طبقه دوم', '۱۴۰۳/۰۷/۱۳', 'ضعیف', '0099887766', 'مهندس کامران قنبری', 'همچنان سطل تخلیه نشده است', '۱۴۰۳/۰7/۱۳ - ۲۳:۵۵'),
-(1, 'G01', 'همکف', '۱۴۰۳/۰۷/۱۳', 'خوب', '0099887766', 'مهندس کامران قنبری', 'مرتب', '۱۴۰۳/۰۷/۱۴ - ۰۰:۰۰'),
--- ارزیابی‌های تاریخ ۱۴۰۳/۰۷/۱۲
-(4, '100', 'طبقه اول', '۱۴۰۳/۰۷/۱۲', 'عالی', '0099887766', 'مهندس کامران قنبری', 'اتاق نمونه با کیفیت بسیار بالا', '۱۴۰۳/۰۷/۱۲ - ۲۳:۳۰'),
-(5, '101', 'طبقه اول', '۱۴۰۳/۰۷/۱۲', 'عالی', '0099887766', 'مهندس کامران قنبری', 'نظم بسیار عالی تخت‌ها', '۱۴۰۳/۰۷/۱۲ - ۲۳:۴۰'),
-(6, '102', 'طبقه اول', '۱۴۰۳/۰۷/۱۲', 'خوب', '0099887766', 'مهندس کامران قنبری', 'وضعیت عمومی خوب', '۱۴۰۳/۰۷/۱۲ - ۲۳:۴۵'),
-(7, '103', 'طبقه اول', '۱۴۰۳/۰۷/۱۲', 'عالی', '0099887766', 'مهندس کامران قنبری', 'اتاق نمونه نخبگان', '۱۴۰۳/۰۷/۱۲ - ۲۳:۵۰'),
-(9, '201', 'طبقه دوم', '۱۴۰۳/۰۷/۱۲', 'متوسط', '0099887766', 'حسین مرادی', 'تذکر شفاهی بابت سینک', '۱۴۰۳/۰۷/۱۳ - ۰۰:۱۰'),
-(10, '202', 'طبقه دوم', '۱۴۰۳/۰۷/۱۲', 'ضعیف', '0099887766', 'حسین مرادی', 'انباشت کیسه‌های زباله پشت درب', '۱۴۰۳/۰۷/۱۳ - ۰۰:۲۰'),
-(1, 'G01', 'همکف', '۱۴۰۳/۰۷/۱۲', 'خوب', '0099887766', 'مهندس کامران قنبری', 'کف تی کشیده شده', '۱۴۰۳/۰۷/۱۲ - ۲۳:۳۰');
 
--- ==========================================================
--- جدول فراخوان‌های هدفمند جشنواره‌ها و مسابقات (festival_calls)
--- ==========================================================
-CREATE TABLE IF NOT EXISTS `festival_calls` (
-  `id` INT AUTO_INCREMENT PRIMARY KEY,
-  `title` VARCHAR(255) NOT NULL,
-  `target_category` ENUM('all', 'sports', 'religious', 'robotics', 'cultural', 'technical', 'skillBased') NOT NULL DEFAULT 'all',
-  `target_sports_team` VARCHAR(100) DEFAULT NULL,
-  `target_skill` VARCHAR(100) DEFAULT NULL,
-  `content` TEXT NOT NULL,
-  `start_date` VARCHAR(30) DEFAULT NULL COMMENT 'تاریخ شروع بازه فراخوان',
-  `deadline_date` VARCHAR(30) NOT NULL COMMENT 'تاریخ و مهلت پایان فراخوان',
-  `issued_by` VARCHAR(150) NOT NULL,
-  `is_active` TINYINT(1) DEFAULT 1,
-  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT INTO `festival_calls` (`title`, `target_category`, `target_sports_team`, `target_skill`, `content`, `start_date`, `deadline_date`, `issued_by`, `is_active`) VALUES
-('فراخوان عضویت و انتخابی تیم فوتبال دانشجویان در مسابقات منطقه‌ای', 'sports', 'فوتبال', 'فوتبال چمنی', 'از کلیه دانشجویان عضو تیم فوتبال و علاقه‌مندان جهت شرکت در تمرینات انتخابی مسابقات منطقه‌ای دعوت به عمل می‌آید.', '۱۴۰۳/۰۷/۱۵', '۱۴۰۳/۰۸/۰۵', 'دکتر علیرضا حسینی (مدیریت امور رفاهی و دانشجویی)', 1),
-('فراخوان دومین المپیاد ملی مهارت‌آموزی و رباتیک دانشجویی', 'robotics', NULL, 'برنامه‌نویسی و ساخت ربات', 'ثبت‌نام متقاضیان رقابت‌های ملی ساخت ربات‌های صنعتی و هوش مصنوعی آغاز شد. جهت هماهنگی با کارشناس پردیس مراجعه فرمایید.', '۱۴۰۳/۰۷/۲۰', '۱۴۰۳/۰۸/۲۰', 'معاونت پژوهش و فناوری پردیس', 1);
+-- (جدول festival_calls در بخش ۴.۲ فوق با تمامی ستون‌ها تعریف شده است)
 
 -- ==========================================================
 -- ۱۱. جداول مدیریت دسترسی و احراز هویت مبتنی بر JWT و RBAC
@@ -447,22 +323,51 @@ CREATE TABLE IF NOT EXISTS `auth_role_permissions` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT IGNORE INTO `auth_role_permissions` (`role`, `permission_key`, `permission_label`, `is_allowed`) VALUES
-('student', 'dorm:room:view_self', 'مشاهده پرونده اسکان و کارت شناسایی خود', 1),
+('student', 'dorm:card:view_self', 'مشاهده و چاپ کارت هوشمند دانشجویی', 1),
+('student', 'dorm:room:view_self', 'مشاهده پرونده اسکان، هم‌اتاقی‌ها و گواهی سکونت', 1),
 ('student', 'dorm:graph:view_self', 'مشاهده گراف تعاملی اتاق و هم‌اتاقی‌ها', 1),
-('student', 'welfare:book', 'رزرو سانس سالن بدنسازی و مدیریت کیف پول', 1),
+('student', 'dorm:guest_request:submit', 'ثبت و پیگیری درخواست اقامت میهمان در خوابگاه', 1),
+('student', 'student:festivals:view', 'مشاهده تب مهارت‌ها، تیم‌های ورزشی و فراخوان‌ها', 1),
+('student', 'skills:graph:view_self', 'مشاهده نقشه تعاملی مهارت‌ها و علایق دانشجو', 1),
+('student', 'skills:graph:manage_self', 'افزودن، ویرایش و چیدمان مهارت‌ها در گراف شخصی', 1),
+('student', 'welfare:book', 'مشاهده خدمات رفاهی، شارژ کیف پول و رزرو سالن بدنسازی', 1),
 ('student', 'student:profile:edit', 'ویرایش شماره تماس و کلمه عبور دانشجویی', 1),
 ('supervisor', 'dorm:attendance:manage', 'ثبت و مدیریت سرشماری شبانه دانشجویان', 1),
 ('supervisor', 'dorm:cleanliness:manage', 'ارزیابی شب به شب کیفیت نظافت اتاق‌ها', 1),
 ('supervisor', 'dorm:maintenance:report', 'ثبت گزارش خرابی و درخواست تعمیر تجهیزات', 1),
 ('supervisor', 'dorm:facilities:view', 'مشاهده شناسنامه امکانات اتاق‌ها', 1),
-('manager', 'dorm:graph:view_all', 'مشاهده گراف جامع کل ساختمان، طبقات و ساکنان', 1),
+('supervisor', 'dorm:guest_request:view', 'مشاهده درخواست‌های اقامت میهمان دانشجویان (فقط خواندنی)', 1),
+('manager', 'dorm:overview:view', 'پیشخوان، آمار کلی و وضعیت طبقات', 1),
+('manager', 'dorm:admitted:manage', 'پذیرش دانشجوی جدید در جدول منبع', 1),
+('manager', 'dorm:unhoused:manage', 'مدیریت متقاضیان خوابگاه در صف اسکان', 1),
+('manager', 'dorm:student:purge', 'حذف کلی دانشجوی متقاضی خوابگاه از تمامی جداول و سامانه', 1),
+('manager', 'dorm:guest_request:manage', 'بررسی، تایید یا رد درخواست‌های اقامت میهمان دانشجویان', 1),
 ('manager', 'dorm:rooms:manage', 'مدیریت اتاق‌ها، طبقات و ظرفیت خوابگاه', 1),
-('manager', 'dorm:allocations:manage', 'اسکان دانشجویان، تغییر اتاق و میهمانی', 1),
-('manager', 'dorm:attendance:manage', 'نظارت و چاپ گزارش‌های سرشماری شبانه', 1),
-('manager', 'dorm:cleanliness:manage', 'نظارت بر رتبه‌بندی نظافت خوابگاه', 1),
+('manager', 'dorm:graph:view_all', 'مشاهده گراف جامع کل ساختمان، طبقات و ساکنان', 1),
+('manager', 'dorm:facilities:manage', 'تکمیل شناسنامه امکانات و تجهیزات اتاق‌ها', 1),
 ('manager', 'dorm:maintenance:resolve', 'رسیدگی به خرابی‌ها و ثبت فاکتور تعمیرات', 1),
+('manager', 'dorm:cleanliness:manage', 'نظارت بر رتبه‌بندی نظافت و خروجی اکسل', 1),
+('manager', 'dorm:allocations:manage', 'دانشجویان ساکن، تغییر اتاق و میهمانی', 1),
+('manager', 'dorm:student_panel:impersonate', 'ورود از کارت دانشجویی به پنل دانشجو (با حفظ نشست مدیر)', 1),
+('manager', 'dorm:supervisor_panel:impersonate', 'ورود از کارت سرپرست به پنل سرپرست شبانه (با حفظ نشست مدیر)', 1),
+('manager', 'dorm:attendance:manage', 'سرشماری شبانه، چاپ و خروجی اکسل', 1),
+('manager', 'dorm:supervisors:manage', 'مدیریت سرپرستان، شیفت‌ها و کاربران مدیر', 1),
+('manager', 'dorm:festivals:manage', 'جشنواره‌ها، داوطلبان و صدور فراخوان', 1),
+('manager', 'dorm:skills:view', 'مشاهده بانک مهارت‌ها و استعدادیابی', 1),
 ('manager', 'welfare:manage', 'مدیریت خدمات رفاهی و سانس‌های ورزشی', 1),
 ('manager', 'auth:tokens:manage', 'مدیریت توکن‌های JWT، ابطال نشست و ماتریس دسترسی', 1);
+
+CREATE TABLE IF NOT EXISTS `auth_user_permissions` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `subject_id` VARCHAR(64) NOT NULL,
+  `role` ENUM('student', 'supervisor', 'manager') NOT NULL,
+  `permission_key` VARCHAR(80) NOT NULL,
+  `is_allowed` TINYINT(1) NOT NULL DEFAULT 1,
+  `updated_by` VARCHAR(64) DEFAULT NULL,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  UNIQUE KEY `uk_user_perm` (`subject_id`, `role`, `permission_key`),
+  INDEX `idx_user_perm_sub` (`subject_id`, `role`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS `auth_jwt_tokens` (
   `id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -499,12 +404,59 @@ CREATE TABLE IF NOT EXISTS `auth_audit_logs` (
   INDEX `idx_audit_event` (`event_type`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE IF NOT EXISTS `auth_student_action_limits` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `action_key` VARCHAR(80) NOT NULL UNIQUE,
+  `action_label` VARCHAR(180) NOT NULL,
+  `permission_key` VARCHAR(80) NOT NULL,
+  `category` VARCHAR(60) NOT NULL,
+  `max_count` INT NOT NULL DEFAULT 1,
+  `window_days` INT NOT NULL DEFAULT 30,
+  `is_limit_enabled` TINYINT(1) NOT NULL DEFAULT 1,
+  `sort_order` INT NOT NULL DEFAULT 0,
+  `updated_by` VARCHAR(64) DEFAULT NULL,
+  `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT IGNORE INTO `auth_student_action_limits`
+(`action_key`, `action_label`, `permission_key`, `category`, `max_count`, `window_days`, `is_limit_enabled`, `sort_order`) VALUES
+('student:profile:change_mobile', 'تغییر شماره تلفن همراه دانشجو', 'student:profile:edit', 'پروفایل و هویت', 1, 30, 1, 10),
+('student:profile:change_password', 'تغییر کلمه عبور حساب دانشجویی', 'student:profile:edit', 'پروفایل و هویت', 2, 30, 1, 20),
+('dorm:guest_request:submit', 'ثبت درخواست اقامت میهمان در خوابگاه', 'dorm:guest_request:submit', 'خوابگاه و اسکان', 2, 30, 1, 30),
+('dorm:card:print', 'چاپ رسمی کارت هوشمند دانشجویی (A4)', 'dorm:card:view_self', 'خوابگاه و اسکان', 5, 30, 1, 40),
+('dorm:certificate:print', 'چاپ گواهی رسمی سکونت در خوابگاه (A4)', 'dorm:room:view_self', 'خوابگاه و اسکان', 3, 30, 1, 50),
+('dorm:graph:view_self', 'مشاهده و بارگذاری گراف تعاملی اتاق و هم‌اتاقی‌ها', 'dorm:graph:view_self', 'خوابگاه و اسکان', 60, 1, 1, 60),
+('welfare:wallet_charge', 'شارژ آنلاین کیف پول الکترونیک', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 5, 7, 1, 70),
+('welfare:book_gym', 'رزرو سانس سالن بدنسازی', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 4, 7, 1, 80),
+('welfare:gym_ticket:print', 'چاپ بلیت دیجیتال سالن بدنسازی (A4)', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 10, 7, 1, 90),
+('skills:graph:view_self', 'مشاهده و بارگذاری نقشه گراف مهارت‌ها', 'skills:graph:view_self', 'گراف مهارت‌ها و علایق', 60, 1, 1, 100),
+('skills:graph:attach_domain', 'افزودن حوزه رسمی دانشگاه به گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 10, 30, 1, 110),
+('skills:graph:detach_domain', 'حذف / جدا کردن حوزه از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 10, 30, 1, 120),
+('skills:graph:create_node', 'ایجاد باکس جدید (مهارت / علاقه / دستاورد / رویداد)', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 15, 7, 1, 130),
+('skills:graph:update_node', 'ویرایش مشخصات باکس در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 140),
+('skills:graph:delete_node', 'حذف باکس شخصی از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 15, 7, 1, 150),
+('skills:graph:create_edge', 'ایجاد خط ارتباطی جدید در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 160),
+('skills:graph:update_edge', 'ویرایش خط ارتباطی در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 170),
+('skills:graph:delete_edge', 'حذف خط ارتباطی از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 20, 7, 1, 180),
+('skills:graph:save_layout', 'ذخیره چیدمان و مختصات گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 100, 1, 1, 190),
+('skills:graph:reset', 'بازنشانی کامل گراف مهارت‌ها به حالت پیش‌فرض', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 2, 30, 1, 200),
+('auth:jwt:refresh', 'تمدید و چرخش توکن JWT نشست دانشجو', 'student:profile:edit', 'امنیت و نشست JWT', 10, 1, 1, 210);
+
+CREATE TABLE IF NOT EXISTS `auth_student_action_logs` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `student_id` VARCHAR(20) NOT NULL,
+  `action_key` VARCHAR(80) NOT NULL,
+  `detail` VARCHAR(255) DEFAULT NULL,
+  `ip_address` VARCHAR(64) DEFAULT NULL,
+  `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_sal_student_action_time` (`student_id`, `action_key`, `created_at`),
+  INDEX `idx_sal_action_time` (`action_key`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ==========================================================
 -- ۱۲. جداول ماژول نقشه مهارت‌ها و علایق دانشجو (University Graph)
 -- ==========================================================
-INSERT IGNORE INTO `auth_role_permissions` (`role`, `permission_key`, `permission_label`, `is_allowed`) VALUES
-('student', 'skills:graph:view_self', 'مشاهده نقشه تعاملی مهارت‌ها و علایق دانشجو', 1),
-('student', 'skills:graph:manage_self', 'افزودن، ویرایش و چیدمان مهارت‌ها در گراف شخصی', 1);
+
 
 CREATE TABLE IF NOT EXISTS `ug_domains` (
   `id` VARCHAR(64) PRIMARY KEY,
@@ -520,15 +472,7 @@ CREATE TABLE IF NOT EXISTS `ug_domains` (
   `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
 
-INSERT IGNORE INTO `ug_domains` (`id`, `title`, `slug`, `description`, `icon`, `color`, `sort_order`, `is_active`) VALUES
-('domain-tech', 'فناوری و برنامه‌نویسی', 'technology', 'توسعه نرم‌افزار، هوش مصنوعی، شبکه، پایگاه داده و وب', 'code', '#06b6d4', 1, 1),
-('domain-edu', 'علمی و آموزشی', 'education', 'علوم پایه، دروس تخصصی، ریاضیات، فیزیک و زبان‌های خارجه', 'book', '#6366f1', 2, 1),
-('domain-research', 'پژوهش و نوآوری', 'research', 'مقالات علمی، ثبت اختراع، پروژه‌های دانش‌بنیان و آزمایشگاهی', 'lightbulb', '#10b981', 3, 1),
-('domain-sport', 'ورزش و تندرستی', 'sport', 'رشته‌های ورزشی تیمی و انفرادی، آمادگی جسمانی و مسابقات', 'activity', '#ef4444', 4, 1),
-('domain-culture', 'فرهنگی و رسانه', 'culture', 'تولید محتوا، نشریات دانشجویی، عکاسی، فیلم و فعالیت‌های عمومی', 'palette', '#f59e0b', 5, 1),
-('domain-art', 'هنر و طراحی', 'art', 'طراحی گرافیک، معماری، موسیقی، تدوین و هنرهای تجسمی', 'pen', '#ec4899', 6, 1),
-('domain-quran', 'عترت و قرآن', 'quran', 'قرائت، حفظ، مفاهیم قرآنی و فعالیت‌های دینی و معارفی', 'bookmark', '#8b5cf6', 7, 1),
-('domain-workshop', 'مهارت‌های فنی و کارگاهی', 'workshop', 'الکترونیک، ساخت و تولید، بردهای سخت‌افزاری و مکاترونیک', 'wrench', '#f97316', 8, 1);
+
 
 CREATE TABLE IF NOT EXISTS `ug_student_domains` (
   `id` VARCHAR(80) PRIMARY KEY,
@@ -633,3 +577,100 @@ CREATE TABLE IF NOT EXISTS `ug_audit_logs` (
   `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
   INDEX `idx_ug_audit_actor` (`actor_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+
+-- ==========================================================
+-- ۱۳. جداول خدمات رفاهی و نوبت‌دهی سالن بدنسازی (Welfare & Gym)
+-- ==========================================================
+CREATE TABLE IF NOT EXISTS `welfare_services` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `title` VARCHAR(150) NOT NULL,
+  `category` VARCHAR(50) NOT NULL DEFAULT 'gym',
+  `location` VARCHAR(150) NOT NULL DEFAULT 'زیرزمین خوابگاه مرکزی صمد',
+  `hourly_rate_rials` BIGINT NOT NULL DEFAULT 50000,
+  `slot_duration_hours` INT NOT NULL DEFAULT 2,
+  `capacity_per_slot` INT NOT NULL DEFAULT 20,
+  `rules_guidelines` TEXT DEFAULT NULL,
+  `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+
+
+
+CREATE TABLE IF NOT EXISTS `welfare_service_slots` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `service_id` INT NOT NULL,
+  `slot_date_jalali` VARCHAR(20) NOT NULL,
+  `slot_date_gregorian` DATE NOT NULL,
+  `day_name_fa` VARCHAR(30) NOT NULL,
+  `start_time` TIME NOT NULL,
+  `end_time` TIME NOT NULL,
+  `duration_hours` INT NOT NULL DEFAULT 2,
+  `total_capacity` INT NOT NULL DEFAULT 20,
+  `booked_count` INT NOT NULL DEFAULT 0,
+  `is_team_reserved` TINYINT(1) NOT NULL DEFAULT 0,
+  `reserved_team_name` VARCHAR(100) DEFAULT NULL,
+  `team_notes` VARCHAR(255) DEFAULT NULL,
+  `is_blocked` TINYINT(1) NOT NULL DEFAULT 0,
+  `block_reason` VARCHAR(150) DEFAULT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_slot_date` (`slot_date_gregorian`),
+  INDEX `idx_slot_jalali` (`slot_date_jalali`),
+  INDEX `idx_slot_service` (`service_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+
+CREATE TABLE IF NOT EXISTS `welfare_bookings` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `booking_token` VARCHAR(64) NOT NULL UNIQUE,
+  `tracking_code` VARCHAR(30) NOT NULL UNIQUE,
+  `service_id` INT NOT NULL,
+  `slot_id` INT NOT NULL,
+  `student_id` VARCHAR(20) NOT NULL,
+  `student_name` VARCHAR(150) NOT NULL DEFAULT 'دانشجوی پردیس',
+  `slot_date_jalali` VARCHAR(20) NOT NULL,
+  `start_time` VARCHAR(10) NOT NULL,
+  `end_time` VARCHAR(10) NOT NULL,
+  `duration_hours` INT NOT NULL DEFAULT 2,
+  `amount_paid_rials` BIGINT NOT NULL DEFAULT 0,
+  `is_team_booking` TINYINT(1) NOT NULL DEFAULT 0,
+  `status` ENUM('confirmed', 'cancelled_by_manager', 'attended') NOT NULL DEFAULT 'confirmed',
+  `refund_status` ENUM('none', 'refunded_to_wallet') NOT NULL DEFAULT 'none',
+  `refunded_at` DATETIME DEFAULT NULL,
+  `cancellation_reason` VARCHAR(255) DEFAULT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX `idx_book_student` (`student_id`),
+  INDEX `idx_book_slot` (`slot_id`),
+  INDEX `idx_book_token` (`booking_token`),
+  INDEX `idx_book_date` (`slot_date_jalali`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+
+-- ==========================================================
+-- ۱۴. جدول درخواست‌های اقامت میهمان دانشجویان (Guest Dormitory Requests)
+-- ==========================================================
+DROP TABLE IF EXISTS `guest_dorm_requests`;
+CREATE TABLE `guest_dorm_requests` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `student_id` VARCHAR(20) NOT NULL COMMENT 'شماره دانشجویی متقاضی میهمان',
+  `full_name` VARCHAR(150) NOT NULL,
+  `national_id` VARCHAR(20) NOT NULL,
+  `mobile` VARCHAR(20) DEFAULT NULL,
+  `field_of_study` VARCHAR(150) DEFAULT NULL,
+  `study_shift` VARCHAR(60) DEFAULT NULL,
+  `was_dorm_applicant` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '0: متقاضی خوابگاه از پیش نبوده | 1: متقاضی قبلی خوابگاه بوده است',
+  `has_active_allocation` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '0: بدون اتاق فعال هنگام ثبت | 1: دارای اسکان قبلی',
+  `problem_description` TEXT NOT NULL COMMENT 'شرح مشکل و دلیل درخواست اقامت میهمان',
+  `requested_days` INT NOT NULL DEFAULT 7 COMMENT 'تعداد روز پیشنهادی دانشجو',
+  `status` ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+  `assigned_room_id` INT DEFAULT NULL,
+  `assigned_room_number` VARCHAR(20) DEFAULT NULL,
+  `approved_days` INT DEFAULT NULL,
+  `manager_note` TEXT DEFAULT NULL,
+  `reviewed_by_id` VARCHAR(64) DEFAULT NULL,
+  `reviewed_by_name` VARCHAR(150) DEFAULT NULL,
+  `reviewed_at` DATETIME DEFAULT NULL,
+  `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  INDEX `idx_gdr_student` (`student_id`),
+  INDEX `idx_gdr_status` (`status`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+
+SET FOREIGN_KEY_CHECKS = 1;

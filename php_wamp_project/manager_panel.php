@@ -16,10 +16,60 @@ session_start();
 require_once 'db.php';
 require_once 'jwt_auth.php';
 
-$jwtAuth = samad_require_page_jwt($pdo, ['manager'], 'dorm:rooms:manage');
+$jwtAuth = samad_require_page_jwt($pdo, ['manager'], null);
+
+$managerTabPermissions = [
+    'overview'       => 'dorm:overview:view',
+    'admitted'       => 'dorm:admitted:manage',
+    'unhoused'       => 'dorm:unhoused:manage',
+    'rooms'          => 'dorm:rooms:manage',
+    'dormgraph'      => 'dorm:graph:view_all',
+    'facilities'     => 'dorm:facilities:manage',
+    'maintenance'    => 'dorm:maintenance:resolve',
+    'cleanliness'    => 'dorm:cleanliness:manage',
+    'students'       => 'dorm:allocations:manage',
+    'guest_requests' => 'dorm:guest_request:manage',
+    'attendance'     => 'dorm:attendance:manage',
+    'supervisors'    => 'dorm:supervisors:manage',
+    'festivals'      => 'dorm:festivals:manage',
+    'skills'         => 'dorm:skills:view',
+    'welfare'        => 'welfare:manage',
+    'authjwt'        => 'auth:tokens:manage',
+];
+
+$canImpersonateStudent = samad_has_permission($jwtAuth, 'dorm:student_panel:impersonate');
+$canImpersonateSupervisor = samad_has_permission($jwtAuth, 'dorm:supervisor_panel:impersonate');
+$canManageGuestRequests = samad_has_permission($jwtAuth, 'dorm:guest_request:manage');
+$canPurgeUnhousedStudent = samad_has_permission($jwtAuth, 'dorm:student:purge');
+
+$computeAllowedManagerTabs = static function (array $auth) use ($managerTabPermissions): array {
+    $tabs = [];
+    foreach ($managerTabPermissions as $tKey => $pKey) {
+        if (samad_has_permission($auth, $pKey)) {
+            $tabs[] = $tKey;
+        }
+    }
+    return $tabs;
+};
+
+$allowedManagerTabs = $computeAllowedManagerTabs($jwtAuth);
+if (empty($allowedManagerTabs)) {
+    samad_render_forbidden_page(
+        'دسترسی مسدود است',
+        'تمامی دسترسی‌های پنل مدیریت برای حساب کاربری شما غیرفعال شده است.',
+        (string)($jwtAuth['role'] ?? 'manager')
+    );
+}
 
 $msg = '';
 $err = '';
+
+if (!function_exists('samad_is_root_manager')) {
+    function samad_is_root_manager(string $nid): bool
+    {
+        return in_array(trim($nid), ['Admin', '0011223344'], true);
+    }
+}
 
 // تابع خودکارسازی ایجاد ستون‌های میهمانی در صورت نبود در دیتابیس لوکال WAMP
 function checkOrAddGuestColumns($pdo) {
@@ -32,6 +82,14 @@ function checkOrAddGuestColumns($pdo) {
                 ADD COLUMN `guest_days_remaining` INT DEFAULT NULL COMMENT 'روزهای باقی‌مانده میهمانی' AFTER `guest_days_total`
             ");
         }
+        $c2 = $pdo->query("SHOW COLUMNS FROM `dorm_allocations` LIKE 'guest_start_date'")->fetchAll();
+        if (empty($c2)) {
+            $pdo->exec("
+                ALTER TABLE `dorm_allocations`
+                ADD COLUMN `guest_start_date` DATE DEFAULT NULL COMMENT 'تاریخ شروع اقامت میهمان' AFTER `guest_days_remaining`,
+                ADD COLUMN `guest_end_date` DATE DEFAULT NULL COMMENT 'تاریخ پایان اقامت میهمان' AFTER `guest_start_date`
+            ");
+        }
         return true;
     } catch (Exception $e) {
         return false;
@@ -39,7 +97,7 @@ function checkOrAddGuestColumns($pdo) {
 }
 checkOrAddGuestColumns($pdo);
 
-// تابع خودکارسازی ستون‌های شیفت کاری سرپرستان
+// تابع خودکارسازی ستون‌های شیفت کاری و ثبت سازنده مدیران
 function checkOrAddSupervisorColumns($pdo) {
     try {
         $c = $pdo->query("SHOW COLUMNS FROM `admins` LIKE 'shift_hours'")->fetchAll();
@@ -50,12 +108,38 @@ function checkOrAddSupervisorColumns($pdo) {
                 ADD COLUMN `shift_days` VARCHAR(150) DEFAULT 'شنبه تا چهارشنبه' AFTER `shift_hours`
             ");
         }
+        $c2 = $pdo->query("SHOW COLUMNS FROM `admins` LIKE 'created_by_national_id'")->fetchAll();
+        if (empty($c2)) {
+            try {
+                $pdo->exec("ALTER TABLE `admins` ADD COLUMN `created_by_national_id` VARCHAR(30) DEFAULT NULL AFTER `role`");
+            } catch (Exception $e2) {
+                $pdo->exec("ALTER TABLE `admins` ADD COLUMN `created_by_national_id` VARCHAR(30) DEFAULT NULL");
+            }
+        }
         return true;
     } catch (Exception $e) {
         return false;
     }
 }
 checkOrAddSupervisorColumns($pdo);
+
+function samad_manager_guard_action(PDO $pdo, array $jwtAuth, string $requiredPerm, string &$err): bool {
+    if (samad_has_permission($jwtAuth, $requiredPerm)) {
+        return true;
+    }
+    samad_log_auth_event(
+        $pdo,
+        'access_denied_403',
+        (string)($jwtAuth['sub'] ?? ''),
+        'manager',
+        $jwtAuth['jti'] ?? null,
+        'manager_panel.php',
+        403,
+        "مجوز {$requiredPerm} برای عملیات درخواستی غیرفعال است"
+    );
+    $err = "شما مجوز انجام این عملیات ({$requiredPerm}) را ندارید (403).";
+    return false;
+}
 
 // توابع محاسبات تقویم جلالی (شمسی) جهت تعیین زمان میهمانی و انقضا
 if (!function_exists('jalali_to_gregorian')) {
@@ -132,50 +216,78 @@ if (!function_exists('add_days_to_jalali_php')) {
     }
 }
 
-// دریافت تب فعال از پارامتر یا پیش‌فرض پیشخوان
-$active_tab = $_GET['tab'] ?? 'overview';
+if (!function_exists('samad_jalali_to_gregorian_ymd')) {
+    function samad_jalali_to_gregorian_ymd($dateStr, $fallbackYmd = null) {
+        $clean = trim(str_replace(['۰','۱','۲','۳','۴','۵','۶','۷','۸','۹','-'], ['0','1','2','3','4','5','6','7','8','9','/'], (string)$dateStr));
+        $parts = explode('/', $clean);
+        if (count($parts) === 3) {
+            $y = intval($parts[0]);
+            $m = intval($parts[1]);
+            $d = intval($parts[2]);
+            if ($y >= 1300 && $y < 1700 && $m >= 1 && $m <= 12 && $d >= 1 && $d <= 31) {
+                list($gy, $gm, $gd) = jalali_to_gregorian($y, $m, $d);
+                if (checkdate($gm, $gd, $gy)) {
+                    return sprintf('%04d-%02d-%02d', $gy, $gm, $gd);
+                }
+            } elseif ($y >= 1970 && $y <= 2100 && checkdate($m, $d, $y)) {
+                return sprintf('%04d-%02d-%02d', $y, $m, $d);
+            }
+        }
+        return $fallbackYmd ?? date('Y-m-d');
+    }
+}
+
+// دریافت تب فعال از پارامتر یا اولین تب مجاز برای این مدیر
+$requested_tab = trim((string)($_GET['tab'] ?? ''));
+$active_tab = in_array($requested_tab, $allowedManagerTabs, true) ? $requested_tab : $allowedManagerTabs[0];
 
 // -------------------------------------------------------------
 // ۱. عملیات: افزودن دانشجوی قبولی به جدول منبع (admitted_students)
 // -------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_add_admitted'])) {
-    $nid   = trim($_POST['national_id'] ?? '');
-    $sid   = trim($_POST['student_id'] ?? '');
-    $name  = trim($_POST['full_name'] ?? '');
-    $campus = trim($_POST['campus'] ?? 'پردیس فناوری');
-    $field = trim($_POST['field_of_study'] ?? '');
+    $active_tab = in_array('admitted', $allowedManagerTabs, true) ? 'admitted' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:admitted:manage', $err)) {
+        $nid   = trim($_POST['national_id'] ?? '');
+        $sid   = trim($_POST['student_id'] ?? '');
+        $name  = trim($_POST['full_name'] ?? '');
+        $campus = trim($_POST['campus'] ?? 'پردیس فناوری');
+        $field = trim($_POST['field_of_study'] ?? '');
 
-    if (!empty($nid) && !empty($sid) && !empty($name) && !empty($field)) {
-        try {
-            $chk = $pdo->prepare("SELECT id FROM `admitted_students` WHERE `national_id` = ? OR `student_id` = ?");
-            $chk->execute([$nid, $sid]);
-            if ($chk->fetch()) {
-                $err = "داوطلبی با این کد ملی ({$nid}) یا شماره دانشجویی ({$sid}) قبلاً در جدول منبع ثبت شده است.";
-            } else {
-                $ins = $pdo->prepare("
-                    INSERT INTO `admitted_students` (`national_id`, `student_id`, `full_name`, `campus`, `field_of_study`, `is_registered`)
-                    VALUES (?, ?, ?, ?, ?, 0)
-                ");
-                $ins->execute([$nid, $sid, $name, $campus, $field]);
-                $msg = "داوطلب جدید «{$name}» با موفقیت در جدول منبع (admitted_students) ثبت شد.";
+        if (!empty($nid) && !empty($sid) && !empty($name) && !empty($field)) {
+            try {
+                $chk = $pdo->prepare("SELECT id FROM `admitted_students` WHERE `national_id` = ? OR `student_id` = ?");
+                $chk->execute([$nid, $sid]);
+                if ($chk->fetch()) {
+                    $err = "داوطلبی با این کد ملی ({$nid}) یا شماره دانشجویی ({$sid}) قبلاً در جدول منبع ثبت شده است.";
+                } else {
+                    $ins = $pdo->prepare("
+                        INSERT INTO `admitted_students` (`national_id`, `student_id`, `full_name`, `campus`, `field_of_study`, `is_registered`)
+                        VALUES (?, ?, ?, ?, ?, 0)
+                    ");
+                    $ins->execute([$nid, $sid, $name, $campus, $field]);
+                    $msg = "داوطلب جدید «{$name}» با موفقیت در جدول منبع (admitted_students) ثبت شد.";
+                }
+            } catch (Exception $e) {
+                $err = "خطا در ثبت داوطلب: " . $e->getMessage();
             }
-        } catch (Exception $e) {
-            $err = "خطا در ثبت داوطلب: " . $e->getMessage();
+        } else {
+            $err = "لطفاً تمامی فیلدهای الزامی داوطلب را تکمیل نمایید.";
         }
-    } else {
-        $err = "لطفاً تمامی فیلدهای الزامی داوطلب را تکمیل نمایید.";
     }
 }
 
 // حذف داوطلب از جدول منبع
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_delete_admitted'])) {
-    $adm_id = intval($_POST['admitted_id'] ?? 0);
-    try {
-        $del = $pdo->prepare("DELETE FROM `admitted_students` WHERE `id` = ?");
-        $del->execute([$adm_id]);
-        $msg = "داوطلب با موفقیت از جدول منبع حذف گردید.";
-    } catch (Exception $e) {
-        $err = "خطا در حذف داوطلب: " . $e->getMessage();
+    $active_tab = in_array('admitted', $allowedManagerTabs, true) ? 'admitted' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:admitted:manage', $err)) {
+        $adm_id = intval($_POST['admitted_id'] ?? 0);
+        try {
+            $del = $pdo->prepare("DELETE FROM `admitted_students` WHERE `id` = ?");
+            $del->execute([$adm_id]);
+            $msg = "داوطلب با موفقیت از جدول منبع حذف گردید.";
+        } catch (Exception $e) {
+            $err = "خطا در حذف داوطلب: " . $e->getMessage();
+        }
     }
 }
 
@@ -183,6 +295,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_delete_admitte
 // ۲. عملیات: اسکان متقاضی با تعیین مدت میهمانی با واحد روز
 // -------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_assign_unhoused'])) {
+    $active_tab = in_array('unhoused', $allowedManagerTabs, true) ? 'unhoused' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:unhoused:manage', $err)) {
     $student_id       = trim($_POST['student_id'] ?? '');
     $room_id          = intval($_POST['room_id'] ?? 0);
     $dorm_status      = trim($_POST['dorm_status'] ?? 'بدون شهریه');
@@ -191,13 +305,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_assign_unhouse
         $gy = intval($_POST['guest_start_year']);
         $gm = intval($_POST['guest_start_month']);
         $gd = intval($_POST['guest_start_day']);
-        $guest_start_date = sprintf('%04d/%02d/%02d', $gy, $gm, $gd);
+        $guest_start_jalali = sprintf('%04d/%02d/%02d', $gy, $gm, $gd);
     } elseif (!empty($_POST['guest_start_date'])) {
-        $guest_start_date = trim($_POST['guest_start_date']);
+        $guest_start_jalali = trim($_POST['guest_start_date']);
     } else {
-        $guest_start_date = '1405/07/25';
+        list($tjy, $tjm, $tjd) = gregorian_to_jalali(intval(date('Y')), intval(date('n')), intval(date('j')));
+        $guest_start_jalali = sprintf('%04d/%02d/%02d', $tjy, $tjm, $tjd);
     }
-    $guest_end_date   = add_days_to_jalali_php($guest_start_date, $guest_days);
+    $guest_start_sql = samad_jalali_to_gregorian_ymd($guest_start_jalali, date('Y-m-d'));
+    $guest_end_jalali = add_days_to_jalali_php($guest_start_jalali, $guest_days);
+    $guest_end_sql = date('Y-m-d', strtotime($guest_start_sql . " + {$guest_days} days"));
+    $guest_days_rem = max(1, (int)ceil((strtotime($guest_end_sql) - strtotime(date('Y-m-d'))) / 86400));
+    if ($guest_days_rem > $guest_days) {
+        $guest_days_rem = $guest_days;
+    }
 
     if (!empty($student_id) && $room_id > 0) {
         try {
@@ -214,8 +335,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_assign_unhouse
                             (`student_id`, `room_id`, `dorm_status`, `allocation_date`, `is_active`, `guest_days_total`, `guest_days_remaining`, `guest_start_date`, `guest_end_date`)
                         VALUES (?, ?, 'میهمان', ?, 1, ?, ?, ?, ?)
                     ");
-                    $ins->execute([$student_id, $room_id, $guest_start_date, $guest_days, $guest_days, $guest_start_date, $guest_end_date]);
-                    $msg = "دانشجو ({$student_id}) به صورت میهمان از تاریخ {$guest_start_date} تا {$guest_end_date} ({$guest_days} روزه) در اتاق اسکان داده شد.";
+                    $ins->execute([$student_id, $room_id, $guest_start_sql, $guest_days, $guest_days_rem, $guest_start_sql, $guest_end_sql]);
+                    $msg = "دانشجو ({$student_id}) به صورت میهمان از تاریخ {$guest_start_jalali} تا {$guest_end_jalali} ({$guest_days} روزه) در اتاق اسکان داده شد.";
                 } else {
                     $ins = $pdo->prepare("
                         INSERT INTO `dorm_allocations` 
@@ -244,12 +365,233 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_assign_unhouse
             $err = "خطا در اسکان دانشجو: " . $e->getMessage();
         }
     }
+    }
+}
+
+// ۲.۵ عملیات: حذف کامل دانشجوی متقاضی خوابگاه از تمامی جداول و پایگاه داده سامانه
+if (!function_exists('samad_purge_student_completely')) {
+    function samad_purge_student_completely(PDO $pdo, string $studentId): array
+    {
+        $studentId = trim($studentId);
+        if ($studentId === '') {
+            throw new Exception('شماره دانشجویی معتبر نیست.');
+        }
+
+        $stmtStu = $pdo->prepare("SELECT `id`, `student_id`, `national_id`, `full_name`, `photo_path` FROM `students` WHERE `student_id` = ? LIMIT 1");
+        $stmtStu->execute([$studentId]);
+        $stu = $stmtStu->fetch(PDO::FETCH_ASSOC);
+        if (!$stu) {
+            throw new Exception("دانشجویی با شماره دانشجویی «{$studentId}» یافت نشد.");
+        }
+
+        $sid = (string)$stu['student_id'];
+        $nid = (string)$stu['national_id'];
+        $fullName = (string)($stu['full_name'] ?? '');
+        $photoPath = trim((string)($stu['photo_path'] ?? ''));
+
+        $chkActive = $pdo->prepare("SELECT `id` FROM `dorm_allocations` WHERE `student_id` = ? AND `is_active` = 1 LIMIT 1");
+        $chkActive->execute([$sid]);
+        if ($chkActive->fetch()) {
+            throw new Exception("دانشجو «{$fullName}» در حال حاضر دارای اتاق فعال است؛ ابتدا اسکان ایشان را لغو نمایید.");
+        }
+
+        $existingTables = array_flip($pdo->query("SHOW TABLES")->fetchAll(PDO::FETCH_COLUMN));
+
+        $pdo->beginTransaction();
+        try {
+            // کاهش ظرفیت اشغال‌شده سانس‌های رفاهی رزروشده توسط دانشجو قبل از حذف رزروها
+            if (isset($existingTables['welfare_bookings']) && isset($existingTables['welfare_service_slots'])) {
+                $stmtSlots = $pdo->prepare("SELECT `slot_id`, COUNT(*) AS `cnt` FROM `welfare_bookings` WHERE `student_id` = ? AND `status` = 'confirmed' GROUP BY `slot_id`");
+                $stmtSlots->execute([$sid]);
+                $updSlot = $pdo->prepare("UPDATE `welfare_service_slots` SET `booked_count` = GREATEST(0, `booked_count` - ?) WHERE `id` = ?");
+                foreach ($stmtSlots->fetchAll(PDO::FETCH_ASSOC) as $sRow) {
+                    $updSlot->execute([(int)$sRow['cnt'], (int)$sRow['slot_id']]);
+                }
+            }
+            if (isset($existingTables['welfare_bookings'])) {
+                $pdo->prepare("DELETE FROM `welfare_bookings` WHERE `student_id` = ?")->execute([$sid]);
+            }
+
+            // پاکسازی گراف مهارت‌ها و دستاوردها
+            if (isset($existingTables['ug_skill_domains'])) {
+                if (isset($existingTables['ug_skills'])) {
+                    $pdo->prepare("DELETE sd FROM `ug_skill_domains` sd INNER JOIN `ug_skills` sk ON sd.`skill_id` = sk.`id` WHERE sk.`student_id` = ?")->execute([$sid]);
+                }
+                if (isset($existingTables['ug_student_domains'])) {
+                    $pdo->prepare("DELETE sd FROM `ug_skill_domains` sd INNER JOIN `ug_student_domains` ud ON sd.`student_domain_id` = ud.`id` WHERE ud.`student_id` = ?")->execute([$sid]);
+                }
+            }
+            if (isset($existingTables['ug_graph_edges'])) {
+                $pdo->prepare("DELETE FROM `ug_graph_edges` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['ug_graph_layouts'])) {
+                $pdo->prepare("DELETE FROM `ug_graph_layouts` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['ug_achievements'])) {
+                $pdo->prepare("DELETE FROM `ug_achievements` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['ug_skills'])) {
+                $pdo->prepare("DELETE FROM `ug_skills` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['ug_student_domains'])) {
+                $pdo->prepare("DELETE FROM `ug_student_domains` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['ug_audit_logs'])) {
+                $pdo->prepare("DELETE FROM `ug_audit_logs` WHERE `actor_id` IN (?, ?) OR `entity_id` IN (?, ?)")->execute([$sid, $nid, $sid, $nid]);
+            }
+
+            // پاکسازی سوابق خوابگاه، حضور و غیاب، میهمانی، مهارت‌ها و جشنواره‌ها
+            if (isset($existingTables['dorm_night_attendance'])) {
+                $pdo->prepare("DELETE FROM `dorm_night_attendance` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['dorm_allocations'])) {
+                $pdo->prepare("DELETE FROM `dorm_allocations` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['guest_dorm_requests'])) {
+                $pdo->prepare("DELETE FROM `guest_dorm_requests` WHERE `student_id` = ? OR `national_id` = ?")->execute([$sid, $nid]);
+            }
+            if (isset($existingTables['student_skills'])) {
+                $pdo->prepare("DELETE FROM `student_skills` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['student_festivals'])) {
+                $pdo->prepare("DELETE FROM `student_festivals` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['student_sports_teams'])) {
+                $pdo->prepare("DELETE FROM `student_sports_teams` WHERE `student_id` = ?")->execute([$sid]);
+            }
+
+            // پاکسازی سهمیه‌ها، توکن‌های JWT، دسترسی‌ها و گزارش‌های ممیزی مرتبط با دانشجو
+            if (isset($existingTables['auth_student_action_logs'])) {
+                $pdo->prepare("DELETE FROM `auth_student_action_logs` WHERE `student_id` = ?")->execute([$sid]);
+            }
+            if (isset($existingTables['auth_user_permissions'])) {
+                $pdo->prepare("DELETE FROM `auth_user_permissions` WHERE `subject_id` IN (?, ?) AND `role` = 'student'")->execute([$sid, $nid]);
+            }
+            if (isset($existingTables['auth_jwt_tokens'])) {
+                $pdo->prepare("DELETE FROM `auth_jwt_tokens` WHERE `subject_id` IN (?, ?) AND `role` = 'student'")->execute([$sid, $nid]);
+            }
+            if (isset($existingTables['auth_audit_logs'])) {
+                $pdo->prepare("
+                    DELETE FROM `auth_audit_logs`
+                    WHERE (`actor_id` IN (?, ?) AND (`actor_role` = 'student' OR `actor_role` IS NULL))
+                       OR `detail` LIKE ?
+                       OR `detail` LIKE ?
+                ")->execute([$sid, $nid, '%' . $sid . '%', '%' . $nid . '%']);
+            }
+
+            // حذف از جدول دانشجویان و جدول منبع پذیرفته‌شدگان
+            if (isset($existingTables['students'])) {
+                $pdo->prepare("DELETE FROM `students` WHERE `student_id` = ? OR `national_id` = ?")->execute([$sid, $nid]);
+            }
+            if (isset($existingTables['admitted_students'])) {
+                $pdo->prepare("DELETE FROM `admitted_students` WHERE `student_id` = ? OR `national_id` = ?")->execute([$sid, $nid]);
+            }
+
+            $pdo->commit();
+        } catch (Exception $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
+
+        // حذف فایل عکس پروفایل آپلودشده در پوشه uploads در صورت عدم استفاده مشترک
+        if ($photoPath !== '' && strpos($photoPath, '..') === false) {
+            $normalizedPhoto = ltrim(str_replace('\\', '/', $photoPath), '/');
+            if (strpos($normalizedPhoto, 'uploads/') === 0) {
+                $fullPhotoFile = __DIR__ . '/' . $normalizedPhoto;
+                if (is_file($fullPhotoFile)) {
+                    $chkPhotoRef = $pdo->prepare("SELECT COUNT(*) FROM `students` WHERE `photo_path` = ?");
+                    $chkPhotoRef->execute([$photoPath]);
+                    if ((int)$chkPhotoRef->fetchColumn() === 0) {
+                        @unlink($fullPhotoFile);
+                    }
+                }
+            }
+        }
+
+        if (!empty($_SESSION['samad_impersonate_student']) && ($_SESSION['samad_impersonate_student']['student_id'] ?? '') === $sid) {
+            unset($_SESSION['samad_impersonate_student']);
+        }
+
+        return [
+            'student_id' => $sid,
+            'national_id' => $nid,
+            'full_name' => $fullName,
+        ];
+    }
+}
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (isset($_POST['action_purge_unhoused_student']) || isset($_POST['action_purge_selected_unhoused_students']))) {
+    $active_tab = in_array('unhoused', $allowedManagerTabs, true) ? 'unhoused' : $active_tab;
+    if (
+        samad_manager_guard_action($pdo, $jwtAuth, 'dorm:unhoused:manage', $err) &&
+        samad_manager_guard_action($pdo, $jwtAuth, 'dorm:student:purge', $err)
+    ) {
+        if (isset($_POST['action_purge_unhoused_student'])) {
+            $targetSid = trim((string)($_POST['student_id'] ?? ''));
+            try {
+                $purged = samad_purge_student_completely($pdo, $targetSid);
+                samad_log_auth_event(
+                    $pdo,
+                    'student_purged',
+                    (string)($jwtAuth['sub'] ?? ''),
+                    'manager',
+                    $jwtAuth['jti'] ?? null,
+                    'manager_panel.php',
+                    200,
+                    'حذف کامل و پاکسازی سراسری پرونده یک دانشجوی متقاضی خوابگاه از تمامی جداول سامانه'
+                );
+                $msg = "دانشجو «{$purged['full_name']}» به صورت کامل و غیرقابل بازگشت از تمامی جداول و پایگاه داده سامانه حذف گردید.";
+            } catch (Exception $e) {
+                $err = 'خطا در حذف کامل دانشجو: ' . $e->getMessage();
+            }
+        } elseif (isset($_POST['action_purge_selected_unhoused_students'])) {
+            $rawIds = $_POST['student_ids'] ?? [];
+            if (!is_array($rawIds)) {
+                $rawIds = explode(',', (string)$rawIds);
+            }
+            $sids = array_values(array_unique(array_filter(array_map('trim', $rawIds), fn($v) => $v !== '')));
+            if (empty($sids)) {
+                $err = 'هیچ دانشجویی برای حذف کامل انتخاب نشده است.';
+            } else {
+                $purgedCount = 0;
+                $purgeErrors = [];
+                foreach ($sids as $sidItem) {
+                    try {
+                        samad_purge_student_completely($pdo, $sidItem);
+                        $purgedCount++;
+                    } catch (Exception $e) {
+                        $purgeErrors[] = $e->getMessage();
+                    }
+                }
+                if ($purgedCount > 0) {
+                    samad_log_auth_event(
+                        $pdo,
+                        'student_purged',
+                        (string)($jwtAuth['sub'] ?? ''),
+                        'manager',
+                        $jwtAuth['jti'] ?? null,
+                        'manager_panel.php',
+                        200,
+                        "حذف کامل گروهی {$purgedCount} دانشجوی متقاضی خوابگاه از تمامی جداول سامانه"
+                    );
+                    $msg = "تعداد {$purgedCount} دانشجوی انتخاب‌شده به صورت کامل از تمامی جداول و پایگاه داده سامانه حذف گردید.";
+                }
+                if (!empty($purgeErrors)) {
+                    $err = implode(' | ', $purgeErrors);
+                }
+            }
+        }
+    }
 }
 
 // -------------------------------------------------------------
 // ۳. عملیات: تغییر اتاق و وضعیت شهریه / روزهای میهمانی دانشجو
 // -------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_student_dorm'])) {
+    $active_tab = in_array('students', $allowedManagerTabs, true) ? 'students' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:allocations:manage', $err)) {
     $student_id       = trim($_POST['student_id'] ?? '');
     $new_room_id      = intval($_POST['new_room_id'] ?? 0);
     $new_dorm_status  = trim($_POST['dorm_status'] ?? 'بدون شهریه');
@@ -258,13 +600,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_student
         $gy = intval($_POST['guest_start_year']);
         $gm = intval($_POST['guest_start_month']);
         $gd = intval($_POST['guest_start_day']);
-        $guest_start_date = sprintf('%04d/%02d/%02d', $gy, $gm, $gd);
+        $guest_start_jalali = sprintf('%04d/%02d/%02d', $gy, $gm, $gd);
+        $guest_start_sql = samad_jalali_to_gregorian_ymd($guest_start_jalali, date('Y-m-d'));
     } elseif (!empty($_POST['guest_start_date'])) {
-        $guest_start_date = trim($_POST['guest_start_date']);
+        $guest_start_jalali = trim($_POST['guest_start_date']);
+        $guest_start_sql = samad_jalali_to_gregorian_ymd($guest_start_jalali, date('Y-m-d'));
     } else {
-        $guest_start_date = '1405/07/25';
+        $guest_start_sql = date('Y-m-d');
     }
-    $guest_end_date   = add_days_to_jalali_php($guest_start_date, $guest_days);
+    $guest_end_sql = date('Y-m-d', strtotime($guest_start_sql . " + {$guest_days} days"));
 
     try {
         $pdo->beginTransaction();
@@ -279,7 +623,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_student
                         (`student_id`, `room_id`, `dorm_status`, `allocation_date`, `is_active`, `guest_days_total`, `guest_days_remaining`, `guest_start_date`, `guest_end_date`)
                     VALUES (?, ?, 'میهمان', ?, 1, ?, ?, ?, ?)
                 ");
-                $ins->execute([$student_id, $new_room_id, $guest_start_date, $guest_days, $guest_days, $guest_start_date, $guest_end_date]);
+                $ins->execute([$student_id, $new_room_id, $guest_start_sql, $guest_days, $guest_days, $guest_start_sql, $guest_end_sql]);
             } else {
                 $ins = $pdo->prepare("
                     INSERT INTO `dorm_allocations` 
@@ -303,63 +647,297 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_student
         $pdo->rollBack();
         $err = "خطا در به‌روزرسانی اسکان: " . $e->getMessage();
     }
+    }
 }
 
 // کسر ۱ روز از مهلت میهمانی
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_reduce_guest_day'])) {
-    $alloc_id = intval($_POST['alloc_id'] ?? 0);
-    try {
-        $stmt = $pdo->prepare("SELECT * FROM `dorm_allocations` WHERE `id` = ? AND `is_active` = 1");
-        $stmt->execute([$alloc_id]);
-        $row = $stmt->fetch();
-        if ($row && $row['dorm_status'] === 'میهمان') {
-            $rem = intval($row['guest_days_remaining'] ?? 7) - 1;
-            if ($rem <= 0) {
-                // انقضا و بازگشت قطعی به فاقدین اسکان
-                $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0, `guest_days_remaining` = 0 WHERE `id` = ?")->execute([$alloc_id]);
-                $pdo->prepare("UPDATE `students` SET `request_dormitory` = 1 WHERE `student_id` = ?")->execute([$row['student_id']]);
-                $msg = "مهلت اقامت میهمان دانشجو ({$row['student_id']}) به پایان رسید و به صورت خودکار به لیست متقاضیان خوابگاه بازگشت.";
-            } else {
-                $pdo->prepare("UPDATE `dorm_allocations` SET `guest_days_remaining` = ? WHERE `id` = ?")->execute([$rem, $alloc_id]);
-                $msg = "یک روز از مهلت اقامت میهمان کسر گردید ({$rem} روز باقی‌مانده).";
+    $active_tab = in_array('students', $allowedManagerTabs, true) ? 'students' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:allocations:manage', $err)) {
+        $alloc_id = intval($_POST['alloc_id'] ?? 0);
+        try {
+            $stmt = $pdo->prepare("SELECT * FROM `dorm_allocations` WHERE `id` = ? AND `is_active` = 1");
+            $stmt->execute([$alloc_id]);
+            $row = $stmt->fetch();
+            if ($row && $row['dorm_status'] === 'میهمان') {
+                $rem = intval($row['guest_days_remaining'] ?? 7) - 1;
+                if ($rem <= 0) {
+                    // انقضا و بازگشت قطعی به فاقدین اسکان
+                    $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0, `guest_days_remaining` = 0 WHERE `id` = ?")->execute([$alloc_id]);
+                    $pdo->prepare("UPDATE `students` SET `request_dormitory` = 1 WHERE `student_id` = ?")->execute([$row['student_id']]);
+                    $msg = "مهلت اقامت میهمان دانشجو ({$row['student_id']}) به پایان رسید و به صورت خودکار به لیست متقاضیان خوابگاه بازگشت.";
+                } else {
+                    $pdo->prepare("UPDATE `dorm_allocations` SET `guest_days_remaining` = ? WHERE `id` = ?")->execute([$rem, $alloc_id]);
+                    $msg = "یک روز از مهلت اقامت میهمان کسر گردید ({$rem} روز باقی‌مانده).";
+                }
             }
+        } catch (Exception $e) {
+            $err = "خطا در کسر روز میهمانی: " . $e->getMessage();
         }
-    } catch (Exception $e) {
-        $err = "خطا در کسر روز میهمانی: " . $e->getMessage();
     }
 }
 
 // اتمام دستی اقامت میهمانی و بازگشت به لیست متقاضیان خوابگاه
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_end_guest_stay'])) {
-    $alloc_id = intval($_POST['alloc_id'] ?? 0);
-    try {
-        $stmt = $pdo->prepare("SELECT * FROM `dorm_allocations` WHERE `id` = ? AND `is_active` = 1");
-        $stmt->execute([$alloc_id]);
-        $row = $stmt->fetch();
-        if ($row) {
-            $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0, `guest_days_remaining` = 0 WHERE `id` = ?")->execute([$alloc_id]);
-            $pdo->prepare("UPDATE `students` SET `request_dormitory` = 1 WHERE `student_id` = ?")->execute([$row['student_id']]);
-            $msg = "اقامت میهمان دانشجو ({$row['student_id']}) به پایان رسید و به لیست متقاضیان خوابگاه بازگردانده شد.";
+    $active_tab = in_array('students', $allowedManagerTabs, true) ? 'students' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:allocations:manage', $err)) {
+        $alloc_id = intval($_POST['alloc_id'] ?? 0);
+        try {
+            $stmt = $pdo->prepare("SELECT * FROM `dorm_allocations` WHERE `id` = ? AND `is_active` = 1");
+            $stmt->execute([$alloc_id]);
+            $row = $stmt->fetch();
+            if ($row) {
+                $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0, `guest_days_remaining` = 0 WHERE `id` = ?")->execute([$alloc_id]);
+                $pdo->prepare("UPDATE `students` SET `request_dormitory` = 1 WHERE `student_id` = ?")->execute([$row['student_id']]);
+                $msg = "اقامت میهمان دانشجو ({$row['student_id']}) به پایان رسید و به لیست متقاضیان خوابگاه بازگردانده شد.";
+            }
+        } catch (Exception $e) {
+            $err = "خطا در اتمام دوره میهمانی: " . $e->getMessage();
         }
-    } catch (Exception $e) {
-        $err = "خطا در اتمام دوره میهمانی: " . $e->getMessage();
     }
 }
 
 // لغو اسکان دانشجو و انتقال به فاقدین اسکان
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_evict_student'])) {
-    $alloc_id = intval($_POST['alloc_id'] ?? 0);
-    try {
-        $stmt = $pdo->prepare("SELECT * FROM `dorm_allocations` WHERE `id` = ?");
-        $stmt->execute([$alloc_id]);
-        $row = $stmt->fetch();
-        if ($row) {
-            $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0 WHERE `id` = ?")->execute([$alloc_id]);
-            $pdo->prepare("UPDATE `students` SET `request_dormitory` = 1 WHERE `student_id` = ?")->execute([$row['student_id']]);
-            $msg = "اسکان دانشجو لغو و به لیست متقاضیان در انتظار اتاق منتقل شد.";
+    $active_tab = in_array('students', $allowedManagerTabs, true) ? 'students' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:allocations:manage', $err)) {
+        $alloc_id = intval($_POST['alloc_id'] ?? 0);
+        try {
+            $stmt = $pdo->prepare("SELECT * FROM `dorm_allocations` WHERE `id` = ?");
+            $stmt->execute([$alloc_id]);
+            $row = $stmt->fetch();
+            if ($row) {
+                $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0 WHERE `id` = ?")->execute([$alloc_id]);
+                $pdo->prepare("UPDATE `students` SET `request_dormitory` = 1 WHERE `student_id` = ?")->execute([$row['student_id']]);
+                $msg = "اسکان دانشجو لغو و به لیست متقاضیان در انتظار اتاق منتقل شد.";
+            }
+        } catch (Exception $e) {
+            $err = "خطا در لغو اسکان: " . $e->getMessage();
         }
-    } catch (Exception $e) {
-        $err = "خطا در لغو اسکان: " . $e->getMessage();
+    }
+}
+
+// ۳.۵ عملیات: ورود مدیر به پنل دانشجو از طریق کارت دانشجویی (با حفظ نشست مدیر و ثبت لاگ امنیتی)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_impersonate_student'])) {
+    $active_tab = in_array('students', $allowedManagerTabs, true) ? 'students' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:student_panel:impersonate', $err)) {
+        $targetSid = trim((string)($_POST['target_student_id'] ?? ''));
+        if ($targetSid === '') {
+            $err = 'شماره دانشجویی هدف نامعتبر است.';
+        } else {
+            try {
+                $stmtStu = $pdo->prepare("SELECT `student_id`, `full_name`, `national_id`, `campus`, `field_of_study` FROM `students` WHERE `student_id` = ? LIMIT 1");
+                $stmtStu->execute([$targetSid]);
+                $stuRow = $stmtStu->fetch(PDO::FETCH_ASSOC);
+                if (!$stuRow) {
+                    $err = 'دانشجوی مورد نظر در پایگاه داده یافت نشد.';
+                } else {
+                    samad_start_student_impersonation($pdo, $jwtAuth, $stuRow);
+                    header('Location: dashboard.php');
+                    exit;
+                }
+            } catch (Exception $e) {
+                $err = 'خطا در ورود به پنل دانشجو: ' . $e->getMessage();
+            }
+        }
+    }
+}
+
+// ۳.۵.۲ عملیات: ورود مدیر به پنل سرپرست از طریق کارت سرپرست (با حفظ نشست مدیر و ثبت لاگ امنیتی)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_impersonate_supervisor'])) {
+    $active_tab = in_array('supervisors', $allowedManagerTabs, true) ? 'supervisors' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:supervisor_panel:impersonate', $err)) {
+        $targetNid = toEnglishDigits(trim((string)($_POST['target_supervisor_nid'] ?? '')));
+        if ($targetNid === '') {
+            $err = 'شناسه کاربری / کد ملی سرپرست هدف نامعتبر است.';
+        } else {
+            try {
+                $stmtSup = $pdo->prepare("SELECT `id`, `full_name`, `national_id`, `role`, `shift_days`, `shift_hours` FROM `admins` WHERE `national_id` = ? AND `role` = 'supervisor' LIMIT 1");
+                $stmtSup->execute([$targetNid]);
+                $supRow = $stmtSup->fetch(PDO::FETCH_ASSOC);
+                if (!$supRow) {
+                    $err = 'سرپرست مورد نظر در پایگاه داده یافت نشد.';
+                } else {
+                    samad_start_supervisor_impersonation($pdo, $jwtAuth, $supRow);
+                    header('Location: supervisor_panel.php');
+                    exit;
+                }
+            } catch (Exception $e) {
+                $err = 'خطا در ورود به پنل سرپرست: ' . $e->getMessage();
+            }
+        }
+    }
+}
+
+// ۳.۶ عملیات: تایید درخواست اقامت میهمان همراه با تخصیص همزمان اتاق و مدت میهمانی
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_approve_guest_request'])) {
+    $active_tab = in_array('guest_requests', $allowedManagerTabs, true) ? 'guest_requests' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:guest_request:manage', $err)) {
+        $reqId = intval($_POST['request_id'] ?? 0);
+        $roomId = intval($_POST['room_id'] ?? 0);
+        $approvedDays = max(1, min(180, intval($_POST['approved_days'] ?? 7)));
+        $managerNote = trim((string)($_POST['manager_note'] ?? ''));
+
+        if (!empty($_POST['guest_req_start_year']) && !empty($_POST['guest_req_start_month']) && !empty($_POST['guest_req_start_day'])) {
+            $gy = intval($_POST['guest_req_start_year']);
+            $gm = intval($_POST['guest_req_start_month']);
+            $gd = intval($_POST['guest_req_start_day']);
+            $guest_start_jalali = sprintf('%04d/%02d/%02d', $gy, $gm, $gd);
+        } else {
+            list($tjy, $tjm, $tjd) = gregorian_to_jalali(intval(date('Y')), intval(date('n')), intval(date('j')));
+            $guest_start_jalali = sprintf('%04d/%02d/%02d', $tjy, $tjm, $tjd);
+        }
+        $guest_start_sql = samad_jalali_to_gregorian_ymd($guest_start_jalali, date('Y-m-d'));
+        $guest_end_jalali = add_days_to_jalali_php($guest_start_jalali, $approvedDays);
+        $guest_end_sql = date('Y-m-d', strtotime($guest_start_sql . " + {$approvedDays} days"));
+        $guest_days_rem = max(1, (int)ceil((strtotime($guest_end_sql) - strtotime(date('Y-m-d'))) / 86400));
+        if ($guest_days_rem > $approvedDays) {
+            $guest_days_rem = $approvedDays;
+        }
+
+        if ($reqId <= 0 || $roomId <= 0) {
+            $err = 'لطفاً اتاق مقصد و درخواست معتبر را انتخاب نمایید.';
+        } else {
+            try {
+                $pdo->beginTransaction();
+                $stmtReq = $pdo->prepare("SELECT * FROM `guest_dorm_requests` WHERE `id` = ? FOR UPDATE");
+                $stmtReq->execute([$reqId]);
+                $reqRow = $stmtReq->fetch(PDO::FETCH_ASSOC);
+
+                if (!$reqRow) {
+                    throw new Exception('درخواست اقامت میهمان یافت نشد.');
+                }
+                if (($reqRow['status'] ?? '') !== 'pending') {
+                    throw new Exception('این درخواست پیش‌تر بررسی و تعیین تکلیف شده است.');
+                }
+
+                $stmtRoom = $pdo->prepare("SELECT `id`, `room_number`, `floor`, `capacity`, `is_active` FROM `dorm_rooms` WHERE `id` = ? LIMIT 1");
+                $stmtRoom->execute([$roomId]);
+                $roomRow = $stmtRoom->fetch(PDO::FETCH_ASSOC);
+                if (!$roomRow || (int)$roomRow['is_active'] !== 1) {
+                    throw new Exception('اتاق انتخاب‌شده فعال یا معتبر نیست.');
+                }
+
+                $targetSid = (string)$reqRow['student_id'];
+                $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0 WHERE `student_id` = ?")->execute([$targetSid]);
+
+                $hasCols = checkOrAddGuestColumns($pdo);
+                if ($hasCols) {
+                    $insAlloc = $pdo->prepare("
+                        INSERT INTO `dorm_allocations`
+                            (`student_id`, `room_id`, `dorm_status`, `allocation_date`, `is_active`, `guest_days_total`, `guest_days_remaining`, `guest_start_date`, `guest_end_date`)
+                        VALUES (?, ?, 'میهمان', ?, 1, ?, ?, ?, ?)
+                    ");
+                    $insAlloc->execute([$targetSid, $roomId, $guest_start_sql, $approvedDays, $guest_days_rem, $guest_start_sql, $guest_end_sql]);
+                } else {
+                    $insAlloc = $pdo->prepare("
+                        INSERT INTO `dorm_allocations`
+                            (`student_id`, `room_id`, `dorm_status`, `allocation_date`, `is_active`)
+                        VALUES (?, ?, 'میهمان', ?, 1)
+                    ");
+                    $insAlloc->execute([$targetSid, $roomId, $guest_start_sql]);
+                }
+
+                $reviewerId = (string)($jwtAuth['sub'] ?? ($_SESSION['admin_national_id'] ?? ''));
+                $reviewerName = (string)($jwtAuth['name'] ?? ($_SESSION['admin_name'] ?? 'مدیر کل'));
+
+                $updReq = $pdo->prepare("
+                    UPDATE `guest_dorm_requests`
+                    SET `status` = 'approved',
+                        `assigned_room_id` = ?,
+                        `assigned_room_number` = ?,
+                        `approved_days` = ?,
+                        `manager_note` = ?,
+                        `reviewed_by_id` = ?,
+                        `reviewed_by_name` = ?,
+                        `reviewed_at` = NOW()
+                    WHERE `id` = ?
+                ");
+                $updReq->execute([
+                    $roomId,
+                    (string)$roomRow['room_number'],
+                    $approvedDays,
+                    $managerNote !== '' ? $managerNote : null,
+                    $reviewerId,
+                    $reviewerName,
+                    $reqId
+                ]);
+
+                $pdo->commit();
+
+                samad_log_auth_event(
+                    $pdo,
+                    'guest_request_approved',
+                    $reviewerId,
+                    'manager',
+                    $jwtAuth['jti'] ?? null,
+                    'manager_panel.php',
+                    200,
+                    "تایید درخواست میهمان #{$reqId} برای {$reqRow['full_name']} ({$targetSid}) در اتاق {$roomRow['room_number']} به مدت {$approvedDays} روز"
+                );
+
+                $msg = "درخواست اقامت میهمان «{$reqRow['full_name']}» با موفقیت تایید و اتاق {$roomRow['room_number']} به مدت {$approvedDays} روز (تا {$guest_end_jalali}) تخصیص داده شد.";
+            } catch (Exception $e) {
+                if ($pdo->inTransaction()) {
+                    $pdo->rollBack();
+                }
+                $err = 'خطا در تایید درخواست اقامت میهمان: ' . $e->getMessage();
+            }
+        }
+    }
+}
+
+// ۳.۷ عملیات: رد درخواست اقامت میهمان
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_reject_guest_request'])) {
+    $active_tab = in_array('guest_requests', $allowedManagerTabs, true) ? 'guest_requests' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:guest_request:manage', $err)) {
+        $reqId = intval($_POST['request_id'] ?? 0);
+        $managerNote = trim((string)($_POST['manager_note'] ?? ''));
+        if ($reqId <= 0) {
+            $err = 'شناسه درخواست نامعتبر است.';
+        } else {
+            try {
+                $stmtReq = $pdo->prepare("SELECT * FROM `guest_dorm_requests` WHERE `id` = ? LIMIT 1");
+                $stmtReq->execute([$reqId]);
+                $reqRow = $stmtReq->fetch(PDO::FETCH_ASSOC);
+                if (!$reqRow) {
+                    $err = 'درخواست مورد نظر یافت نشد.';
+                } elseif (($reqRow['status'] ?? '') !== 'pending') {
+                    $err = 'این درخواست قبلاً بررسی شده است.';
+                } else {
+                    $reviewerId = (string)($jwtAuth['sub'] ?? ($_SESSION['admin_national_id'] ?? ''));
+                    $reviewerName = (string)($jwtAuth['name'] ?? ($_SESSION['admin_name'] ?? 'مدیر کل'));
+                    $upd = $pdo->prepare("
+                        UPDATE `guest_dorm_requests`
+                        SET `status` = 'rejected',
+                            `manager_note` = ?,
+                            `reviewed_by_id` = ?,
+                            `reviewed_by_name` = ?,
+                            `reviewed_at` = NOW()
+                        WHERE `id` = ? AND `status` = 'pending'
+                    ");
+                    $upd->execute([
+                        $managerNote !== '' ? $managerNote : 'رد درخواست توسط مدیریت خوابگاه',
+                        $reviewerId,
+                        $reviewerName,
+                        $reqId
+                    ]);
+                    samad_log_auth_event(
+                        $pdo,
+                        'guest_request_rejected',
+                        $reviewerId,
+                        'manager',
+                        $jwtAuth['jti'] ?? null,
+                        'manager_panel.php',
+                        200,
+                        "رد درخواست اقامت میهمان #{$reqId} برای {$reqRow['full_name']} ({$reqRow['student_id']})"
+                    );
+                    $msg = "درخواست اقامت میهمان دانشجو «{$reqRow['full_name']}» رد شد.";
+                }
+            } catch (Exception $e) {
+                $err = 'خطا در رد درخواست میهمان: ' . $e->getMessage();
+            }
+        }
     }
 }
 
@@ -367,155 +945,233 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_evict_student'
 // ۴. عملیات: مدیریت اتاق‌ها (فعال/غیرفعال، حذف، ایجاد اتاق)
 // -------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_toggle_room'])) {
-    $room_id = intval($_POST['room_id'] ?? 0);
-    $current_status = intval($_POST['current_status'] ?? 0);
-    $new_status = $current_status === 1 ? 0 : 1;
-    try {
-        $stmt = $pdo->prepare("UPDATE `dorm_rooms` SET `is_active` = ? WHERE `id` = ?");
-        $stmt->execute([$new_status, $room_id]);
-        $msg = "وضعیت فعالیت اتاق با موفقیت به " . ($new_status === 1 ? "«فعال»" : "«غیرفعال»") . " تغییر یافت.";
-    } catch (Exception $e) {
-        $err = "خطا در تغییر وضعیت اتاق: " . $e->getMessage();
+    $active_tab = in_array('rooms', $allowedManagerTabs, true) ? 'rooms' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:rooms:manage', $err)) {
+        $room_id = intval($_POST['room_id'] ?? 0);
+        $current_status = intval($_POST['current_status'] ?? 0);
+        $new_status = $current_status === 1 ? 0 : 1;
+        try {
+            $stmt = $pdo->prepare("UPDATE `dorm_rooms` SET `is_active` = ? WHERE `id` = ?");
+            $stmt->execute([$new_status, $room_id]);
+            $msg = "وضعیت فعالیت اتاق با موفقیت به " . ($new_status === 1 ? "«فعال»" : "«غیرفعال»") . " تغییر یافت.";
+        } catch (Exception $e) {
+            $err = "خطا در تغییر وضعیت اتاق: " . $e->getMessage();
+        }
     }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_delete_room'])) {
-    $room_id = intval($_POST['room_id'] ?? 0);
-    try {
-        $pdo->beginTransaction();
-        $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0 WHERE `room_id` = ?")->execute([$room_id]);
-        $del = $pdo->prepare("DELETE FROM `dorm_rooms` WHERE `id` = ?");
-        $del->execute([$room_id]);
-        $pdo->commit();
-        $msg = "اتاق با موفقیت حذف گردید و دانشجویان ساکن آن به لیست فاقدین اسکان منتقل شدند.";
-    } catch (Exception $e) {
-        $pdo->rollBack();
-        $err = "خطا در حذف اتاق: " . $e->getMessage();
+    $active_tab = in_array('rooms', $allowedManagerTabs, true) ? 'rooms' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:rooms:manage', $err)) {
+        $room_id = intval($_POST['room_id'] ?? 0);
+        try {
+            $pdo->beginTransaction();
+            $pdo->prepare("UPDATE `dorm_allocations` SET `is_active` = 0 WHERE `room_id` = ?")->execute([$room_id]);
+            $del = $pdo->prepare("DELETE FROM `dorm_rooms` WHERE `id` = ?");
+            $del->execute([$room_id]);
+            $pdo->commit();
+            $msg = "اتاق با موفقیت حذف گردید و دانشجویان ساکن آن به لیست فاقدین اسکان منتقل شدند.";
+        } catch (Exception $e) {
+            $pdo->rollBack();
+            $err = "خطا در حذف اتاق: " . $e->getMessage();
+        }
     }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_add_room'])) {
-    $room_number = trim($_POST['room_number'] ?? '');
-    $floor       = trim($_POST['floor'] ?? 'همکف');
-    $capacity    = intval($_POST['capacity'] ?? 4);
-    $description = trim($_POST['description'] ?? '');
+    $active_tab = in_array('rooms', $allowedManagerTabs, true) ? 'rooms' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:rooms:manage', $err)) {
+        $room_number = trim($_POST['room_number'] ?? '');
+        $floor       = trim($_POST['floor'] ?? 'همکف');
+        $capacity    = intval($_POST['capacity'] ?? 4);
+        $description = trim($_POST['description'] ?? '');
 
-    if (!empty($room_number)) {
-        try {
-            $stmt = $pdo->prepare("INSERT INTO `dorm_rooms` (`room_number`, `floor`, `capacity`, `is_active`, `description`) VALUES (?, ?, ?, 1, ?)");
-            $stmt->execute([$room_number, $floor, $capacity, $description]);
-            $msg = "اتاق جدید ({$room_number}) با موفقیت به {$floor} اضافه شد.";
-        } catch (Exception $e) {
-            $err = "خطا در ایجاد اتاق: " . $e->getMessage();
+        if (!empty($room_number)) {
+            try {
+                $stmt = $pdo->prepare("INSERT INTO `dorm_rooms` (`room_number`, `floor`, `capacity`, `is_active`, `description`) VALUES (?, ?, ?, 1, ?)");
+                $stmt->execute([$room_number, $floor, $capacity, $description]);
+                $msg = "اتاق جدید ({$room_number}) با موفقیت به {$floor} اضافه شد.";
+            } catch (Exception $e) {
+                $err = "خطا در ایجاد اتاق: " . $e->getMessage();
+            }
         }
     }
 }
 
 // -------------------------------------------------------------
-// ۵. عملیات: افزودن و حذف سرپرست خوابگاه و کاربر مدیر کل
+// ۵. عملیات: افزودن و حذف سرپرست خوابگاه و کاربر مدیر کل (با سیاست دسترسی و رمز ثابت حذف)
 // -------------------------------------------------------------
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && (isset($_POST['action_add_supervisor']) || isset($_POST['action_add_manager']))) {
-    $active_tab = 'supervisors';
-    $requestedRole = isset($_POST['action_add_manager']) ? 'manager' : trim($_POST['admin_role'] ?? 'supervisor');
-    $targetRole = ($requestedRole === 'manager') ? 'manager' : 'supervisor';
+    $active_tab = in_array('supervisors', $allowedManagerTabs, true) ? 'supervisors' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:supervisors:manage', $err)) {
+        $requestedRole = isset($_POST['action_add_manager']) ? 'manager' : trim($_POST['admin_role'] ?? 'supervisor');
+        $targetRole = ($requestedRole === 'manager') ? 'manager' : 'supervisor';
 
-    $sup_nid   = toEnglishDigits(trim($_POST['sup_national_id'] ?? ($_POST['mgr_national_id'] ?? '')));
-    $sup_name  = trim($_POST['sup_full_name'] ?? ($_POST['mgr_full_name'] ?? ''));
-    $defaultPass = ($targetRole === 'manager') ? 'Admin@12345' : 'Super@12345';
-    $sup_pass  = trim($_POST['sup_password'] ?? ($_POST['mgr_password'] ?? ''));
-    if ($sup_pass === '') {
-        $sup_pass = $defaultPass;
+        $sup_nid   = toEnglishDigits(trim($_POST['sup_national_id'] ?? ($_POST['mgr_national_id'] ?? '')));
+        $sup_name  = trim($_POST['sup_full_name'] ?? ($_POST['mgr_full_name'] ?? ''));
+        $defaultPass = ($targetRole === 'manager') ? 'Admin@12345' : 'Super@12345';
+        $sup_pass  = trim($_POST['sup_password'] ?? ($_POST['mgr_password'] ?? ''));
+        if ($sup_pass === '') {
+            $sup_pass = $defaultPass;
+        }
+        $sup_shift_days  = trim($_POST['sup_shift_days'] ?? ($targetRole === 'manager' ? 'شنبه تا پنج‌شنبه' : 'شنبه تا چهارشنبه'));
+        $sup_shift_hours = trim($_POST['sup_shift_hours'] ?? ($targetRole === 'manager' ? '۰۸:۰۰ الی ۱۶:۰۰ (اداری)' : '۲۲:۰۰ الی ۰۶:۰۰ (شیفت شب)'));
+        $creatorNid = (string)($jwtAuth['sub'] ?? '');
+
+        if (!preg_match('/^\d{10}$/', $sup_nid)) {
+            $err = "کد ملی باید دقیقاً ۱۰ رقم عددی معتبر باشد.";
+        } elseif (empty($sup_name)) {
+            $err = "لطفاً نام و نام خانوادگی کاربر را وارد نمایید.";
+        } elseif (strlen($sup_pass) < 4) {
+            $err = "کلمه عبور باید حداقل ۴ کاراکتر باشد.";
+        } else {
+            try {
+                $chk = $pdo->prepare("SELECT id, role FROM `admins` WHERE `national_id` = ?");
+                $chk->execute([$sup_nid]);
+                if ($chk->fetch()) {
+                    $err = "کد ملی {$sup_nid} قبلاً برای یک کاربر در سامانه ثبت شده است.";
+                } else {
+                    $hash = password_hash($sup_pass, PASSWORD_DEFAULT);
+                    $hasCols = checkOrAddSupervisorColumns($pdo);
+                    if ($hasCols) {
+                        $ins = $pdo->prepare("INSERT INTO `admins` (`national_id`, `password_hash`, `role`, `full_name`, `shift_hours`, `shift_days`, `created_by_national_id`) VALUES (?, ?, ?, ?, ?, ?, ?)");
+                        $ins->execute([$sup_nid, $hash, $targetRole, $sup_name, $sup_shift_hours, $sup_shift_days, $creatorNid]);
+                    } else {
+                        $ins = $pdo->prepare("INSERT INTO `admins` (`national_id`, `password_hash`, `role`, `full_name`) VALUES (?, ?, ?, ?)");
+                        $ins->execute([$sup_nid, $hash, $targetRole, $sup_name]);
+                    }
+                    if ($targetRole === 'manager') {
+                        $myPerms = is_array($jwtAuth['permissions'] ?? null) ? $jwtAuth['permissions'] : [];
+                        if (isset($_POST['mgr_permissions_submitted'])) {
+                            $reqPerms = $_POST['mgr_permissions'] ?? [];
+                            if (!is_array($reqPerms)) $reqPerms = [];
+                            $grantedPerms = array_values(array_intersect($reqPerms, $myPerms));
+                        } else {
+                            $grantedPerms = $myPerms;
+                        }
+                        samad_set_user_permissions($pdo, $sup_nid, 'manager', $grantedPerms, $creatorNid);
+                        samad_log_auth_event($pdo, 'permission_updated', $creatorNid, 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "ایجاد مدیر {$sup_nid} با " . count($grantedPerms) . " مجوز اختصاصی");
+                        $msg = "کاربر مدیر جدید «{$sup_name}» (کد ملی: {$sup_nid}) با " . count($grantedPerms) . " دسترسی مجاز ایجاد گردید.";
+                    } else {
+                        $msg = "سرپرست جدید «{$sup_name}» با موفقیت ایجاد گردید.";
+                    }
+                }
+            } catch (Exception $e) {
+                $err = "خطا در ثبت کاربر: " . $e->getMessage();
+            }
+        }
     }
-    $sup_shift_days  = trim($_POST['sup_shift_days'] ?? ($targetRole === 'manager' ? 'شنبه تا پنج‌شنبه' : 'شنبه تا چهارشنبه'));
-    $sup_shift_hours = trim($_POST['sup_shift_hours'] ?? ($targetRole === 'manager' ? '۰۸:۰۰ الی ۱۶:۰۰ (اداری)' : '۲۲:۰۰ الی ۰۶:۰۰ (شیفت شب)'));
+}
 
-    if (!preg_match('/^\d{10}$/', $sup_nid)) {
-        $err = "کد ملی باید دقیقاً ۱۰ رقم عددی معتبر باشد.";
-    } elseif (empty($sup_name)) {
-        $err = "لطفاً نام و نام خانوادگی کاربر را وارد نمایید.";
-    } elseif (strlen($sup_pass) < 4) {
-        $err = "کلمه عبور باید حداقل ۴ کاراکتر باشد.";
-    } else {
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_manager_permissions'])) {
+    $active_tab = in_array('supervisors', $allowedManagerTabs, true) ? 'supervisors' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:supervisors:manage', $err)) {
+        $mgr_id = intval($_POST['manager_id'] ?? 0);
+        $currentNid = trim((string)($jwtAuth['sub'] ?? ''));
         try {
-            $chk = $pdo->prepare("SELECT id, role FROM `admins` WHERE `national_id` = ?");
-            $chk->execute([$sup_nid]);
-            if ($chk->fetch()) {
-                $err = "کد ملی {$sup_nid} قبلاً برای یک کاربر در سامانه ثبت شده است.";
+            $stmtTarget = $pdo->prepare("SELECT * FROM `admins` WHERE `id` = ? AND `role` = 'manager' LIMIT 1");
+            $stmtTarget->execute([$mgr_id]);
+            $targetMgr = $stmtTarget->fetch();
+            $targetCreatorNid = $targetMgr ? trim((string)($targetMgr['created_by_national_id'] ?? '')) : '';
+            if (!$targetMgr) {
+                $err = "کاربر مدیر مورد نظر یافت نشد.";
+            } elseif (trim((string)$targetMgr['national_id']) === $currentNid) {
+                $err = "تغییر سیاست دسترسی حساب کاربری فعلی شما از این بخش مجاز نیست.";
+            } elseif (samad_is_root_manager((string)$targetMgr['national_id'])) {
+                $err = "امکان محدودسازی یا تغییر سیاست دسترسی مدیر ارشد سامانه وجود ندارد.";
+            } elseif (!samad_is_root_manager($currentNid) && $targetCreatorNid !== $currentNid) {
+                samad_log_auth_event($pdo, 'access_denied_403', $currentNid, 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 403, "تلاش غیرمجاز برای تغییر سیاست مدیر {$targetMgr['national_id']}");
+                $err = "شما فقط مجاز به سیاست‌گذاری برای مدیرانی هستید که خودتان ایجاد کرده‌اید (403).";
             } else {
-                $hash = password_hash($sup_pass, PASSWORD_DEFAULT);
-                $hasCols = checkOrAddSupervisorColumns($pdo);
-                if ($hasCols) {
-                    $ins = $pdo->prepare("INSERT INTO `admins` (`national_id`, `password_hash`, `role`, `full_name`, `shift_hours`, `shift_days`) VALUES (?, ?, ?, ?, ?, ?)");
-                    $ins->execute([$sup_nid, $hash, $targetRole, $sup_name, $sup_shift_hours, $sup_shift_days]);
-                } else {
-                    $ins = $pdo->prepare("INSERT INTO `admins` (`national_id`, `password_hash`, `role`, `full_name`) VALUES (?, ?, ?, ?)");
-                    $ins->execute([$sup_nid, $hash, $targetRole, $sup_name]);
-                }
-                if ($targetRole === 'manager') {
-                    $msg = "کاربر مدیر کل جدید «{$sup_name}» (کد ملی: {$sup_nid}) با دسترسی کامل مدیریتی ایجاد گردید.";
-                } else {
-                    $msg = "سرپرست جدید «{$sup_name}» با موفقیت ایجاد گردید.";
-                }
+                $myPerms = is_array($jwtAuth['permissions'] ?? null) ? $jwtAuth['permissions'] : [];
+                $reqPerms = $_POST['mgr_permissions'] ?? [];
+                if (!is_array($reqPerms)) $reqPerms = [];
+                $grantedPerms = array_values(array_intersect($reqPerms, $myPerms));
+                samad_set_user_permissions($pdo, trim((string)$targetMgr['national_id']), 'manager', $grantedPerms, $currentNid);
+                samad_log_auth_event($pdo, 'permission_updated', $currentNid, 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "بروزرسانی دسترسی‌های اختصاصی مدیر {$targetMgr['national_id']} (" . count($grantedPerms) . " مجوز)");
+                $msg = "سیاست دسترسی‌های کاربر مدیر «{$targetMgr['full_name']}» با موفقیت ذخیره و فوراً اعمال شد (" . count($grantedPerms) . " قابلیت فعال).";
             }
         } catch (Exception $e) {
-            $err = "خطا در ثبت کاربر: " . $e->getMessage();
+            $err = "خطا در ذخیره سیاست دسترسی مدیر: " . $e->getMessage();
         }
     }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_supervisor_shift'])) {
-    $active_tab = 'supervisors';
-    $sup_id = intval($_POST['supervisor_id'] ?? 0);
-    $sup_shift_days  = trim($_POST['sup_shift_days'] ?? 'شنبه تا چهارشنبه');
-    $sup_shift_hours = trim($_POST['sup_shift_hours'] ?? '۲۲:۰۰ الی ۰۶:۰۰ (شیفت شب)');
-    try {
-        checkOrAddSupervisorColumns($pdo);
-        $up = $pdo->prepare("UPDATE `admins` SET `shift_hours` = ?, `shift_days` = ? WHERE `id` = ? AND `role` = 'supervisor'");
-        $up->execute([$sup_shift_hours, $sup_shift_days, $sup_id]);
-        $msg = "روزها و ساعات کاری شیفت سرپرست با موفقیت به‌روزرسانی شد.";
-    } catch (Exception $e) {
-        $err = "خطا در تغییر شیفت سرپرست: " . $e->getMessage();
+    $active_tab = in_array('supervisors', $allowedManagerTabs, true) ? 'supervisors' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:supervisors:manage', $err)) {
+        $sup_id = intval($_POST['supervisor_id'] ?? 0);
+        $sup_shift_days  = trim($_POST['sup_shift_days'] ?? 'شنبه تا چهارشنبه');
+        $sup_shift_hours = trim($_POST['sup_shift_hours'] ?? '۲۲:۰۰ الی ۰۶:۰۰ (شیفت شب)');
+        try {
+            checkOrAddSupervisorColumns($pdo);
+            $up = $pdo->prepare("UPDATE `admins` SET `shift_hours` = ?, `shift_days` = ? WHERE `id` = ? AND `role` = 'supervisor'");
+            $up->execute([$sup_shift_hours, $sup_shift_days, $sup_id]);
+            $msg = "روزها و ساعات کاری شیفت سرپرست با موفقیت به‌روزرسانی شد.";
+        } catch (Exception $e) {
+            $err = "خطا در تغییر شیفت سرپرست: " . $e->getMessage();
+        }
     }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_delete_supervisor'])) {
-    $active_tab = 'supervisors';
-    $sup_id = intval($_POST['supervisor_id'] ?? 0);
-    try {
-        $pdo->prepare("DELETE FROM `admins` WHERE `id` = ? AND `role` = 'supervisor'")->execute([$sup_id]);
-        $msg = "سرپرست از سامانه حذف گردید.";
-    } catch (Exception $e) {
-        $err = "خطا در حذف سرپرست: " . $e->getMessage();
+    $active_tab = in_array('supervisors', $allowedManagerTabs, true) ? 'supervisors' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:supervisors:manage', $err)) {
+        $sup_id = intval($_POST['supervisor_id'] ?? 0);
+        try {
+            $pdo->prepare("DELETE FROM `admins` WHERE `id` = ? AND `role` = 'supervisor'")->execute([$sup_id]);
+            $msg = "سرپرست از سامانه حذف گردید.";
+        } catch (Exception $e) {
+            $err = "خطا در حذف سرپرست: " . $e->getMessage();
+        }
     }
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_delete_manager'])) {
-    $active_tab = 'supervisors';
-    $mgr_id = intval($_POST['manager_id'] ?? 0);
-    try {
-        $stmtTarget = $pdo->prepare("SELECT * FROM `admins` WHERE `id` = ? AND `role` = 'manager' LIMIT 1");
-        $stmtTarget->execute([$mgr_id]);
-        $targetMgr = $stmtTarget->fetch();
-        $currentNid = $jwtAuth['sub'] ?? ($_SESSION['admin_national_id'] ?? '');
-        $mgrCount = intval($pdo->query("SELECT COUNT(*) FROM `admins` WHERE `role` = 'manager'")->fetchColumn());
+    $active_tab = in_array('supervisors', $allowedManagerTabs, true) ? 'supervisors' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:supervisors:manage', $err)) {
+        $mgr_id = intval($_POST['manager_id'] ?? 0);
+        $deleteSecret = trim((string)($_POST['delete_manager_secret'] ?? ''));
+        try {
+            $stmtTarget = $pdo->prepare("SELECT * FROM `admins` WHERE `id` = ? AND `role` = 'manager' LIMIT 1");
+            $stmtTarget->execute([$mgr_id]);
+            $targetMgr = $stmtTarget->fetch();
+            $currentNid = (string)($jwtAuth['sub'] ?? '');
+            $mgrCount = intval($pdo->query("SELECT COUNT(*) FROM `admins` WHERE `role` = 'manager'")->fetchColumn());
 
-        if (!$targetMgr) {
-            $err = "کاربر مدیر مورد نظر یافت نشد.";
-        } elseif ($targetMgr['national_id'] === $currentNid) {
-            $err = "امکان حذف حساب کاربری مدیریتی که اکنون با آن وارد شده‌اید وجود ندارد.";
-        } elseif ($mgrCount <= 1) {
-            $err = "حداقل یک کاربر مدیر کل باید در سامانه باقی بماند.";
-        } else {
-            $pdo->prepare("DELETE FROM `admins` WHERE `id` = ? AND `role` = 'manager'")->execute([$mgr_id]);
-            $msg = "کاربر مدیر «{$targetMgr['full_name']}» از سامانه حذف گردید.";
+            if (!$targetMgr) {
+                $err = "کاربر مدیر مورد نظر یافت نشد.";
+            } elseif ($targetMgr['national_id'] === $currentNid) {
+                $err = "امکان حذف حساب کاربری مدیریتی که اکنون با آن وارد شده‌اید وجود ندارد.";
+            } elseif (samad_is_root_manager((string)$targetMgr['national_id'])) {
+                samad_log_auth_event($pdo, 'access_denied_403', $currentNid, 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 403, 'تلاش برای حذف مدیر ارشد اصلی سامانه');
+                $err = "کاربر مدیر ارشد اصلی سامانه توسط هیچ کاربری قابل حذف نیست.";
+            } elseif (!samad_is_root_manager($currentNid) && ($targetMgr['created_by_national_id'] ?? '') !== $currentNid) {
+                samad_log_auth_event($pdo, 'access_denied_403', $currentNid, 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 403, "تلاش غیرمجاز حذف مدیر {$targetMgr['national_id']} خارج از سلسله‌مراتب");
+                $err = "شما تنها مجاز به حذف مدیرانی هستید که خودتان ایجاد کرده‌اید (امکان حذف مدیر بالادستی یا هم‌سطح وجود ندارد).";
+            } elseif ($mgrCount <= 1) {
+                $err = "حداقل یک کاربر مدیر کل باید در سامانه باقی بماند.";
+            } elseif ($deleteSecret === '' || !hash_equals(SAMAD_MANAGER_DELETE_SECRET, $deleteSecret)) {
+                samad_log_auth_event($pdo, 'access_denied_403', $currentNid, 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 403, "رمز ثابت حذف مدیر برای {$targetMgr['national_id']} اشتباه بود");
+                $err = "رمز ثابت ۱۰ رقمی حذف کاربر مدیر نامعتبر است.";
+            } else {
+                $pdo->prepare("DELETE FROM `admins` WHERE `id` = ? AND `role` = 'manager'")->execute([$mgr_id]);
+                $pdo->prepare("DELETE FROM `auth_user_permissions` WHERE `subject_id` = ? AND `role` = 'manager'")->execute([$targetMgr['national_id']]);
+                $pdo->prepare("UPDATE `auth_jwt_tokens` SET `revoked_at` = NOW(), `revoked_by` = ?, `revoke_reason` = 'حذف کاربر مدیر با تایید رمز ثابت' WHERE `subject_id` = ? AND `role` = 'manager' AND `revoked_at` IS NULL")
+                    ->execute([$currentNid, $targetMgr['national_id']]);
+                samad_log_auth_event($pdo, 'token_revoked', $currentNid, 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف مدیر {$targetMgr['national_id']} با تایید رمز ثابت ۱۰ رقمی");
+                $msg = "کاربر مدیر «{$targetMgr['full_name']}» با تایید رمز امنیتی از سامانه حذف و نشست‌های ایشان ابطال گردید.";
+            }
+        } catch (Exception $e) {
+            $err = "خطا در حذف کاربر مدیر: " . $e->getMessage();
         }
-    } catch (Exception $e) {
-        $err = "خطا در حذف کاربر مدیر: " . $e->getMessage();
     }
 }
 
 // ۸. عملیات: ثبت و تکمیل اطلاعات و امکانات اتاق (Room Facilities)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_save_facilities'])) {
+    $active_tab = in_array('facilities', $allowedManagerTabs, true) ? 'facilities' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:facilities:manage', $err)) {
     $r_num       = trim($_POST['room_number'] ?? '');
     $fridge      = trim($_POST['fridge_model'] ?? 'یخچال ۵ فوت امرسان');
     $bed_type    = trim($_POST['bed_type'] ?? 'تخت فلزی دو طبقه استاندارد');
@@ -532,29 +1188,49 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_save_facilitie
     $fac_notes   = trim($_POST['notes'] ?? '');
 
     try {
-        $rRow = $pdo->prepare("SELECT id FROM `dorm_rooms` WHERE `room_number` = ?");
+        $rRow = $pdo->prepare("SELECT `id`, `floor` FROM `dorm_rooms` WHERE `room_number` = ?");
         $rRow->execute([$r_num]);
         $rmFound = $rRow->fetch();
-        $roomId = $rmFound ? $rmFound['id'] : null;
+        if (!$rmFound) {
+            throw new Exception("اتاق شماره «{$r_num}» در جدول اتاق‌ها یافت نشد.");
+        }
+        $roomId = (int)$rmFound['id'];
+        $roomFloor = $rmFound['floor'];
+        $wardrobeSummary = $wardrobe ? 'کمد دیواری اختصاصی قفل‌دار (موجود)' : 'فاقد کمد اختصاصی';
+        $carpetSummary = $carpet ? 'فرش ماشینی اتاق (موجود)' : 'فاقد فرش';
+        $secItems = [
+            ['name' => 'سازه تخت‌ها: ' . $bed_type, 'count' => 1, 'condition' => 'ثبت شده'],
+            ['name' => 'سرمایش/گرمایش: ' . $ac_heater, 'count' => 1, 'condition' => 'ثبت شده'],
+        ];
+        if ($tv !== '') $secItems[] = ['name' => 'تلویزیون: ' . $tv, 'count' => 1, 'condition' => 'سالم'];
+        if ($broom) $secItems[] = ['name' => 'جارو و خاک‌انداز', 'count' => 1, 'condition' => 'سالم'];
+        if ($trash) $secItems[] = ['name' => 'سطل زباله پدالی', 'count' => 1, 'condition' => 'سالم'];
+        if ($bucket) $secItems[] = ['name' => 'لگن و سطل شستشو', 'count' => 1, 'condition' => 'سالم'];
+        if ($desk) $secItems[] = ['name' => 'میز و صندلی مطالعه', 'count' => 1, 'condition' => 'سالم'];
+        if ($shoe_rack) $secItems[] = ['name' => 'جاکفشی طبقاتی', 'count' => 1, 'condition' => 'سالم'];
+        if ($mirror) $secItems[] = ['name' => 'آینه دیواری', 'count' => 1, 'condition' => 'سالم'];
+        $secJson = json_encode($secItems, JSON_UNESCAPED_UNICODE);
 
         $checkFac = $pdo->prepare("SELECT id FROM `room_facilities` WHERE `room_number` = ?");
         $checkFac->execute([$r_num]);
         if ($checkFac->fetch()) {
             $upFac = $pdo->prepare("
                 UPDATE `room_facilities` SET
-                    `fridge_model` = ?, `bed_type` = ?, `has_broom` = ?, `has_trash_bin` = ?, `has_bucket` = ?,
-                    `tv_model` = ?, `ac_heater` = ?, `has_carpet` = ?, `has_wardrobe` = ?, `has_desk` = ?,
-                    `has_shoe_rack` = ?, `has_mirror` = ?, `notes` = ?, `room_id` = ?, `updated_at` = NOW()
+                    `floor` = ?, `refrigerator` = ?, `wardrobe` = ?, `carpet` = ?, `secondary_facilities` = ?, `status` = 'تکمیل‌شده',
+                    `fridge_model` = ?, `bed_type` = ?, `ac_heater` = ?, `tv_model` = ?,
+                    `has_broom` = ?, `has_trash_bin` = ?, `has_bucket` = ?, `has_carpet` = ?,
+                    `has_wardrobe` = ?, `has_desk` = ?, `has_shoe_rack` = ?, `has_mirror` = ?,
+                    `notes` = ?, `room_id` = ?, `updated_at` = NOW()
                 WHERE `room_number` = ?
             ");
-            $upFac->execute([$fridge, $bed_type, $broom, $trash, $bucket, $tv, $ac_heater, $carpet, $wardrobe, $desk, $shoe_rack, $mirror, $fac_notes, $roomId, $r_num]);
+            $upFac->execute([$roomFloor, $fridge, $wardrobeSummary, $carpetSummary, $secJson, $fridge, $bed_type, $ac_heater, $tv, $broom, $trash, $bucket, $carpet, $wardrobe, $desk, $shoe_rack, $mirror, $fac_notes, $roomId, $r_num]);
         } else {
             $insFac = $pdo->prepare("
                 INSERT INTO `room_facilities` 
-                    (`room_id`, `room_number`, `fridge_model`, `bed_type`, `has_broom`, `has_trash_bin`, `has_bucket`, `tv_model`, `ac_heater`, `has_carpet`, `has_wardrobe`, `has_desk`, `has_shoe_rack`, `has_mirror`, `notes`)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (`room_id`, `room_number`, `floor`, `refrigerator`, `wardrobe`, `carpet`, `secondary_facilities`, `status`, `fridge_model`, `bed_type`, `ac_heater`, `has_broom`, `has_trash_bin`, `has_bucket`, `tv_model`, `has_carpet`, `has_wardrobe`, `has_desk`, `has_shoe_rack`, `has_mirror`, `notes`)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'تکمیل‌شده', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
-            $insFac->execute([$roomId, $r_num, $fridge, $bed_type, $broom, $trash, $bucket, $tv, $ac_heater, $carpet, $wardrobe, $desk, $shoe_rack, $mirror, $fac_notes]);
+            $insFac->execute([$roomId, $r_num, $roomFloor, $fridge, $wardrobeSummary, $carpetSummary, $secJson, $fridge, $bed_type, $ac_heater, $broom, $trash, $bucket, $tv, $carpet, $wardrobe, $desk, $shoe_rack, $mirror, $fac_notes]);
         }
 
         // بروزرسانی وضعیت تکمیل اتاق
@@ -563,17 +1239,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_save_facilitie
     } catch (Exception $e) {
         $err = "خطا در ثبت امکانات اتاق: " . $e->getMessage();
     }
+    }
 }
 
 // ۹. عملیات: ثبت اقدام مدیر و فاکتور مالی خرابی و تعمیرات (Maintenance Resolution)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_resolve_maintenance'])) {
+    $active_tab = in_array('maintenance', $allowedManagerTabs, true) ? 'maintenance' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:maintenance:resolve', $err)) {
     $rep_id       = intval($_POST['report_id'] ?? 0);
     $act_taken    = trim($_POST['action_taken'] ?? 'repair');
     $cost_rials   = intval($_POST['cost_rials'] ?? 0);
     $inv_num      = trim($_POST['invoice_number'] ?? '');
     $contractor   = trim($_POST['contractor_or_store_name'] ?? '');
     $res_notes    = trim($_POST['resolution_notes'] ?? '');
-    $mgr_name     = trim($_POST['resolved_by'] ?? ($_SESSION['admin_name'] ?? 'دکتر علیرضا حسینی (مدیر امور رفاهی)'));
+    $mgr_name     = trim($_POST['resolved_by'] ?? ($_SESSION['admin_name'] ?? 'مدیر امور دانشجویی و رفاهی'));
 
     if ($rep_id > 0) {
         try {
@@ -597,7 +1276,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_resolve_mainte
             $params = [$statusVal];
 
             if ($hasActionTaken)   { $sets[] = "`action_taken` = ?"; $params[] = $act_taken; }
-            if ($hasResAction)     { $sets[] = "`resolution_action` = ?"; $params[] = ($act_taken === 'replacement' ? 'خرید و جایگزینی نو' : 'تعمیر قطعه'); }
+            if ($hasResAction)     { $sets[] = "`resolution_action` = ?"; $params[] = ($act_taken === 'replacement' ? 'خرید و جایگزینی تجهیز نو' : 'تعمیر قطعه'); }
             if ($hasCostRials)     { $sets[] = "`cost_rials` = ?"; $params[] = $cost_rials; }
             if ($hasResCost)       { $sets[] = "`resolution_cost` = ?"; $params[] = $cost_rials; }
             if ($hasInvoice)       { $sets[] = "`invoice_number` = ?"; $params[] = $inv_num; }
@@ -617,10 +1296,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_resolve_mainte
             $err = "خطا در ثبت اقدام گزارش خرابی: " . $e->getMessage();
         }
     }
+    }
 }
 
 // ۱۰. عملیات: ایجاد فراخوان هدفمند جدید توسط مدیریت با بازه زمانی (دیت‌پیکر شروع و پایان)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_create_festival_call'])) {
+    $active_tab = in_array('festivals', $allowedManagerTabs, true) ? 'festivals' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:festivals:manage', $err)) {
     $call_title   = trim($_POST['call_title'] ?? '');
     $call_cat     = trim($_POST['call_category'] ?? 'general');
     $call_desc    = trim($_POST['call_description'] ?? '');
@@ -708,16 +1390,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_create_festiva
     } else {
         $err = "عنوان فراخوان الزامی است.";
     }
+    }
 }
 
 // ۱۱. عملیات: حذف فراخوان
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_delete_festival_call'])) {
-    $cid = intval($_POST['call_id'] ?? 0);
-    try {
-        $pdo->prepare("DELETE FROM `festival_calls` WHERE `id` = ?")->execute([$cid]);
-        $msg = "فراخوان با موفقیت حذف گردید.";
-    } catch (Exception $e) {
-        $err = "خطا در حذف فراخوان: " . $e->getMessage();
+    $active_tab = in_array('festivals', $allowedManagerTabs, true) ? 'festivals' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:festivals:manage', $err)) {
+        $cid = intval($_POST['call_id'] ?? 0);
+        try {
+            $pdo->prepare("DELETE FROM `festival_calls` WHERE `id` = ?")->execute([$cid]);
+            $msg = "فراخوان با موفقیت حذف گردید.";
+        } catch (Exception $e) {
+            $err = "خطا در حذف فراخوان: " . $e->getMessage();
+        }
     }
 }
 
@@ -727,7 +1413,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_delete_festiva
 
 // ۱۲.۱ ویرایش مشخصات و نرخ ساعتی سالن بدنسازی
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_welfare_gym'])) {
-    $active_tab  = 'welfare';
+    $active_tab  = in_array('welfare', $allowedManagerTabs, true) ? 'welfare' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'welfare:manage', $err)) {
     $serv_id     = intval($_POST['service_id'] ?? 1);
     $title       = trim($_POST['service_title'] ?? 'سالن بدنسازی و پرورش اندام پردیس');
     $location    = trim($_POST['service_location'] ?? 'زیرزمین خوابگاه مرکزی صمد');
@@ -748,11 +1435,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_update_welfare
     } catch (Exception $e) {
         $err = "خطا در ذخیره مشخصات سالن: " . $e->getMessage();
     }
+    }
 }
 
 // ۱۲.۲ تولید خودکار سانس‌های استاندارد (۸ تا ۲۲ به جز ۱۲ تا ۱۴ برای ناهار)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_generate_gym_slots'])) {
-    $active_tab = 'welfare';
+    $active_tab = in_array('welfare', $allowedManagerTabs, true) ? 'welfare' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'welfare:manage', $err)) {
     $serv_id = intval($_POST['service_id'] ?? 1);
     try {
         // واکشی ظرفیت سالن
@@ -812,11 +1501,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_generate_gym_s
     } catch (Exception $e) {
         $err = "خطا در تولید سانس‌های سالن: " . $e->getMessage();
     }
+    }
 }
 
 // ۱۲.۳ رزرو اختصاصی سانس برای تیم‌های ورزشی دانشگاه و اتصال هوشمند به فراخوان‌های هدفمند
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_team_reserve_slot'])) {
-    $active_tab = 'welfare';
+    $active_tab = in_array('welfare', $allowedManagerTabs, true) ? 'welfare' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'welfare:manage', $err)) {
     $slot_id   = intval($_POST['slot_id'] ?? 0);
     $team_name = trim($_POST['target_sports_team'] ?? '');
     $notes     = trim($_POST['team_notes'] ?? 'تمرین اختصاصی و آمادگی جسمانی تیم ورزشی در سالن بدنسازی');
@@ -866,11 +1557,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_team_reserve_s
     } else {
         $err = "لطفاً سانس و تیم ورزشی مورد نظر را مشخص فرمایید.";
     }
+    }
 }
 
 // ۱۲.۴ لغو اضطراری نوبت‌های سانس توسط مدیر با عودت خودکار وجه به کیف پول دانشجویان (تفکیک شده از مسدودسازی)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_manager_cancel_slot'])) {
-    $active_tab = 'welfare';
+    $active_tab = in_array('welfare', $allowedManagerTabs, true) ? 'welfare' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'welfare:manage', $err)) {
     $slot_id = intval($_POST['slot_id'] ?? 0);
     $reason  = trim($_POST['cancellation_reason'] ?? 'لغو اضطراری نوبت‌ها توسط مدیریت');
     $block_too = isset($_POST['block_slot_too']) ? 1 : 0;
@@ -948,11 +1641,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_manager_cancel
             $err = "خطا در لغو نوبت‌های سانس و عودت وجه: " . $e->getMessage();
         }
     }
+    }
 }
 
 // ۱۲.۵ عملیات مستقل: مسدود کردن یا بازگشایی سانس سالن (بدون لغو نوبت)
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_toggle_block_slot'])) {
-    $active_tab = 'welfare';
+    $active_tab = in_array('welfare', $allowedManagerTabs, true) ? 'welfare' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'welfare:manage', $err)) {
     $slot_id = intval($_POST['slot_id'] ?? 0);
     $set_blocked = intval($_POST['set_blocked'] ?? 0);
     $reason = trim($_POST['block_reason'] ?? 'تعمیرات دوره‌ای و نظافت سالن');
@@ -972,11 +1667,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_toggle_block_s
             $err = "خطا در تغییر وضعیت مسدودی سانس: " . $e->getMessage();
         }
     }
+    }
 }
 
 // ۱۲.۶ عملیات مستقل: لغو تکی یک نوبت خاص دانشجو همراه با عودت آنی وجه به کیف پول
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_cancel_single_booking'])) {
-    $active_tab = 'welfare';
+    $active_tab = in_array('welfare', $allowedManagerTabs, true) ? 'welfare' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'welfare:manage', $err)) {
     $booking_id = intval($_POST['booking_id'] ?? 0);
     $reason = trim($_POST['cancellation_reason'] ?? 'لغو نوبت توسط مدیریت دانشگاه');
 
@@ -1018,6 +1715,211 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action_cancel_single_
             $err = "خطا در لغو نوبت دانشجو: " . $e->getMessage();
         }
     }
+    }
+}
+
+// ۱۳. قابلیت حذف دونه به دونه یا کلی سوابق سرشماری شبانه (Attendance)
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (
+    isset($_POST['action_delete_attendance_record']) ||
+    isset($_POST['action_delete_selected_attendance']) ||
+    isset($_POST['action_delete_date_attendance']) ||
+    isset($_POST['action_delete_all_attendance'])
+)) {
+    $active_tab = in_array('attendance', $allowedManagerTabs, true) ? 'attendance' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:attendance:manage', $err)) {
+        if (isset($_POST['action_delete_attendance_record'])) {
+            $att_id = intval($_POST['attendance_id'] ?? 0);
+            if ($att_id > 0) {
+                try {
+                    $chkStmt = $pdo->prepare("
+                        SELECT d.id, d.student_id, d.attendance_date, s.full_name
+                        FROM `dorm_night_attendance` d
+                        LEFT JOIN `students` s ON d.student_id = s.student_id
+                        WHERE d.id = ?
+                    ");
+                    $chkStmt->execute([$att_id]);
+                    $attRow = $chkStmt->fetch();
+                    if ($attRow) {
+                        $delStmt = $pdo->prepare("DELETE FROM `dorm_night_attendance` WHERE `id` = ?");
+                        $delStmt->execute([$att_id]);
+                        $stdName = $attRow['full_name'] ?: $attRow['student_id'];
+                        samad_log_auth_event($pdo, 'attendance_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف رکورد سرشماری #{$att_id} برای {$stdName} ({$attRow['attendance_date']})");
+                        $msg = "رکورد سرشماری شبانه «{$stdName}» برای تاریخ {$attRow['attendance_date']} با موفقیت حذف شد.";
+                    } else {
+                        $err = "رکورد سرشماری مورد نظر یافت نشد یا پیش‌تر حذف شده است.";
+                    }
+                } catch (Exception $e) {
+                    $err = "خطا در حذف رکورد سرشماری: " . $e->getMessage();
+                }
+            } else {
+                $err = "شناسه رکورد سرشماری معتبر نیست.";
+            }
+        } elseif (isset($_POST['action_delete_selected_attendance'])) {
+            $rawIds = $_POST['attendance_ids'] ?? [];
+            if (!is_array($rawIds)) {
+                $rawIds = explode(',', (string)$rawIds);
+            }
+            $ids = array_values(array_unique(array_filter(array_map('intval', $rawIds), fn($v) => $v > 0)));
+            if (!empty($ids)) {
+                try {
+                    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+                    $delStmt = $pdo->prepare("DELETE FROM `dorm_night_attendance` WHERE `id` IN ({$placeholders})");
+                    $delStmt->execute($ids);
+                    $deletedCount = $delStmt->rowCount();
+                    samad_log_auth_event($pdo, 'attendance_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف انتخابی {$deletedCount} رکورد سرشماری شبانه");
+                    $msg = "تعداد {$deletedCount} رکورد انتخاب‌شده از سرشماری شبانه با موفقیت حذف شد.";
+                } catch (Exception $e) {
+                    $err = "خطا در حذف گروهی رکوردهای سرشماری: " . $e->getMessage();
+                }
+            } else {
+                $err = "هیچ رکورد ثبت‌شده‌ای برای حذف انتخاب نشده است.";
+            }
+        } elseif (isset($_POST['action_delete_date_attendance'])) {
+            $targetDate = trim((string)($_POST['target_att_date'] ?? $_POST['att_date'] ?? ''));
+            if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $targetDate)) {
+                try {
+                    $delStmt = $pdo->prepare("DELETE FROM `dorm_night_attendance` WHERE `attendance_date` = ?");
+                    $delStmt->execute([$targetDate]);
+                    $deletedCount = $delStmt->rowCount();
+                    samad_log_auth_event($pdo, 'attendance_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف کلی {$deletedCount} رکورد سرشماری تاریخ {$targetDate}");
+                    if ($deletedCount > 0) {
+                        $msg = "تمامی سوابق سرشماری شبانه تاریخ {$targetDate} ({$deletedCount} رکورد) با موفقیت حذف شد.";
+                    } else {
+                        $err = "برای تاریخ {$targetDate} رکورد سرشماری ثبت‌شده‌ای یافت نشد.";
+                    }
+                } catch (Exception $e) {
+                    $err = "خطا در حذف سرشماری تاریخ انتخابی: " . $e->getMessage();
+                }
+            } else {
+                $err = "فرمت تاریخ سرشماری معتبر نیست.";
+            }
+        } elseif (isset($_POST['action_delete_all_attendance'])) {
+            try {
+                $delStmt = $pdo->prepare("DELETE FROM `dorm_night_attendance`");
+                $delStmt->execute();
+                $deletedCount = $delStmt->rowCount();
+                samad_log_auth_event($pdo, 'attendance_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف کل سوابق سرشماری شبانه ({$deletedCount} رکورد)");
+                if ($deletedCount > 0) {
+                    $msg = "کل سوابق سرشماری شبانه خوابگاه ({$deletedCount} رکورد در تمامی تاریخ‌ها) با موفقیت پاکسازی و حذف شد.";
+                } else {
+                    $err = "هیچ رکورد سرشماری ثبت‌شده‌ای در سامانه وجود ندارد.";
+                }
+            } catch (Exception $e) {
+                $err = "خطا در حذف کل سوابق سرشماری: " . $e->getMessage();
+            }
+        }
+    }
+}
+
+// ۱۴. قابلیت حذف دونه به دونه یا کلی سوابق ارزیابی نظافت (Cleanliness)
+$cleanViewMode = in_array((string)($_POST['clean_view'] ?? $_GET['clean_view'] ?? 'ranking'), ['ranking', 'history'], true)
+    ? (string)($_POST['clean_view'] ?? $_GET['clean_view'] ?? 'ranking')
+    : 'ranking';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && (
+    isset($_POST['action_delete_cleanliness_record']) ||
+    isset($_POST['action_delete_selected_cleanliness']) ||
+    isset($_POST['action_delete_room_cleanliness']) ||
+    isset($_POST['action_delete_date_cleanliness']) ||
+    isset($_POST['action_delete_all_cleanliness'])
+)) {
+    $active_tab = in_array('cleanliness', $allowedManagerTabs, true) ? 'cleanliness' : $active_tab;
+    if (samad_manager_guard_action($pdo, $jwtAuth, 'dorm:cleanliness:manage', $err)) {
+        if (isset($_POST['action_delete_cleanliness_record'])) {
+            $rec_id = intval($_POST['record_id'] ?? 0);
+            if ($rec_id > 0) {
+                try {
+                    $chkStmt = $pdo->prepare("SELECT id, room_number, inspection_date FROM `room_cleanliness_records` WHERE `id` = ?");
+                    $chkStmt->execute([$rec_id]);
+                    $recRow = $chkStmt->fetch();
+                    if ($recRow) {
+                        $delStmt = $pdo->prepare("DELETE FROM `room_cleanliness_records` WHERE `id` = ?");
+                        $delStmt->execute([$rec_id]);
+                        samad_log_auth_event($pdo, 'cleanliness_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف رکورد نظافت #{$rec_id} اتاق {$recRow['room_number']} ({$recRow['inspection_date']})");
+                        $msg = "گزارش ارزیابی نظافت اتاق {$recRow['room_number']} مربوط به تاریخ {$recRow['inspection_date']} با موفقیت حذف شد.";
+                    } else {
+                        $err = "رکورد نظافت مورد نظر یافت نشد یا پیش‌تر حذف شده است.";
+                    }
+                } catch (Exception $e) {
+                    $err = "خطا در حذف رکورد نظافت: " . $e->getMessage();
+                }
+            } else {
+                $err = "شناسه رکورد نظافت معتبر نیست.";
+            }
+        } elseif (isset($_POST['action_delete_selected_cleanliness'])) {
+            $rawIds = $_POST['record_ids'] ?? [];
+            if (!is_array($rawIds)) {
+                $rawIds = explode(',', (string)$rawIds);
+            }
+            $ids = array_values(array_unique(array_filter(array_map('intval', $rawIds), fn($v) => $v > 0)));
+            if (!empty($ids)) {
+                try {
+                    $placeholders = implode(',', array_fill(0, count($ids), '?'));
+                    $delStmt = $pdo->prepare("DELETE FROM `room_cleanliness_records` WHERE `id` IN ({$placeholders})");
+                    $delStmt->execute($ids);
+                    $deletedCount = $delStmt->rowCount();
+                    samad_log_auth_event($pdo, 'cleanliness_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف انتخابی {$deletedCount} رکورد ارزیابی نظافت");
+                    $msg = "تعداد {$deletedCount} رکورد انتخاب‌شده از سوابق نظافت با موفقیت حذف شد.";
+                } catch (Exception $e) {
+                    $err = "خطا در حذف گروهی سوابق نظافت: " . $e->getMessage();
+                }
+            } else {
+                $err = "هیچ رکوردی برای حذف انتخاب نشده است.";
+            }
+        } elseif (isset($_POST['action_delete_room_cleanliness'])) {
+            $targetRoom = trim((string)($_POST['room_number'] ?? ''));
+            if ($targetRoom !== '') {
+                try {
+                    $delStmt = $pdo->prepare("DELETE FROM `room_cleanliness_records` WHERE `room_number` = ?");
+                    $delStmt->execute([$targetRoom]);
+                    $deletedCount = $delStmt->rowCount();
+                    samad_log_auth_event($pdo, 'cleanliness_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف کلی {$deletedCount} رکورد نظافت اتاق {$targetRoom}");
+                    if ($deletedCount > 0) {
+                        $msg = "تمامی سوابق ارزیابی نظافت اتاق {$targetRoom} ({$deletedCount} رکورد) با موفقیت حذف شد.";
+                    } else {
+                        $err = "برای اتاق {$targetRoom} سابقه نظافتی ثبت نشده است.";
+                    }
+                } catch (Exception $e) {
+                    $err = "خطا در حذف سوابق نظافت اتاق: " . $e->getMessage();
+                }
+            } else {
+                $err = "شماره اتاق برای حذف سوابق مشخص نشده است.";
+            }
+        } elseif (isset($_POST['action_delete_date_cleanliness'])) {
+            $targetInspDate = trim((string)($_POST['inspection_date'] ?? ''));
+            if ($targetInspDate !== '') {
+                try {
+                    $delStmt = $pdo->prepare("DELETE FROM `room_cleanliness_records` WHERE `inspection_date` = ?");
+                    $delStmt->execute([$targetInspDate]);
+                    $deletedCount = $delStmt->rowCount();
+                    samad_log_auth_event($pdo, 'cleanliness_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف کلی {$deletedCount} رکورد نظافت تاریخ {$targetInspDate}");
+                    if ($deletedCount > 0) {
+                        $msg = "تمامی ارزیابی‌های نظافت تاریخ {$targetInspDate} ({$deletedCount} رکورد) با موفقیت حذف شد.";
+                    } else {
+                        $err = "برای تاریخ {$targetInspDate} سابقه نظافتی یافت نشد.";
+                    }
+                } catch (Exception $e) {
+                    $err = "خطا در حذف نظافت تاریخ انتخابی: " . $e->getMessage();
+                }
+            } else {
+                $err = "تاریخ بازرسی برای حذف انتخاب نشده است.";
+            }
+        } elseif (isset($_POST['action_delete_all_cleanliness'])) {
+            try {
+                $delStmt = $pdo->prepare("DELETE FROM `room_cleanliness_records`");
+                $delStmt->execute();
+                $deletedCount = $delStmt->rowCount();
+                samad_log_auth_event($pdo, 'cleanliness_deleted', (string)($jwtAuth['sub'] ?? ''), 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "حذف کل سوابق نظافت خوابگاه ({$deletedCount} رکورد)");
+                if ($deletedCount > 0) {
+                    $msg = "کل سوابق ارزیابی نظافت خوابگاه ({$deletedCount} رکورد) با موفقیت پاکسازی و حذف شد.";
+                } else {
+                    $err = "هیچ سابقه نظافتی در سامانه ثبت نشده است.";
+                }
+            } catch (Exception $e) {
+                $err = "خطا در حذف کل سوابق نظافت: " . $e->getMessage();
+            }
+        }
+    }
 }
 
 
@@ -1050,7 +1952,7 @@ $allRooms = $pdo->query("
 
 // ۴. واکشی دانشجویان ساکن و جزئیات اسکان (به همراه استان و شهر برای پرونده کامل)
 $housedAllocations = $pdo->query("
-    SELECT a.*, s.full_name, s.national_id, s.mobile, s.field_of_study, s.study_shift, s.province, s.city, s.campus,
+    SELECT a.*, s.full_name, s.national_id, s.mobile, s.field_of_study, s.study_shift, s.province, s.city, s.campus, s.photo_path,
            r.room_number, r.floor, r.capacity, r.is_active AS room_is_active
     FROM `dorm_allocations` a
     JOIN `students` s ON a.student_id = s.student_id
@@ -1075,77 +1977,6 @@ try {
     ")->fetchAll();
 } catch (Exception $e) {}
 
-if (empty($studentFestivals)) {
-    $studentFestivals = [
-        [
-            'student_id' => '4012130045',
-            'full_name' => 'علی رضایی مقدم',
-            'national_id' => '0021487591',
-            'mobile' => '09121234567',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی کامپیوتر - هوش مصنوعی',
-            'festival_key' => 'technical',
-            'festival_title' => 'جشنواره‌ها و المپیادهای فنی و اختراعات',
-            'created_at' => '1404-07-10'
-        ],
-        [
-            'student_id' => '4012130045',
-            'full_name' => 'علی رضایی مقدم',
-            'national_id' => '0021487591',
-            'mobile' => '09121234567',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی کامپیوتر - هوش مصنوعی',
-            'festival_key' => 'robotics',
-            'festival_title' => 'رویدادهای رباتیک و هوش مصنوعی',
-            'created_at' => '1404-07-12'
-        ],
-        [
-            'student_id' => '4012130046',
-            'full_name' => 'سارا احمدی',
-            'national_id' => '0019845231',
-            'mobile' => '09129876543',
-            'campus' => 'پردیس مهارت',
-            'field_of_study' => 'گرافیک و ارتباط تصویری',
-            'festival_key' => 'cultural',
-            'festival_title' => 'جشنواره فرهنگی، ادبی و هنری',
-            'created_at' => '1404-07-15'
-        ],
-        [
-            'student_id' => '4012130047',
-            'full_name' => 'امیرحسین کاظمی',
-            'national_id' => '0452318974',
-            'mobile' => '09351239988',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی برق - الکترونیک و مخابرات',
-            'festival_key' => 'religious',
-            'festival_title' => 'مسابقات و جشنواره‌های مذهبی و قرآنی',
-            'created_at' => '1404-07-18'
-        ],
-        [
-            'student_id' => '4012130048',
-            'full_name' => 'زهرا محمدی',
-            'national_id' => '1278965412',
-            'mobile' => '09135554433',
-            'campus' => 'پردیس مهارت',
-            'field_of_study' => 'معماری و دکوراسیون داخلی',
-            'festival_key' => 'skillBased',
-            'festival_title' => 'جشنواره ملی مهارت و کارآفرینی',
-            'created_at' => '1404-07-20'
-        ],
-        [
-            'student_id' => '4012130050',
-            'full_name' => 'رضا باقری',
-            'national_id' => '0041258963',
-            'mobile' => '09127778899',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی مکانیک و مکاترونیک',
-            'festival_key' => 'technical',
-            'festival_title' => 'جشنواره‌ها و المپیادهای فنی و اختراعات',
-            'created_at' => '1404-07-22'
-        ]
-    ];
-}
-
 // ۸. واکشی مهارت‌های دانشجویان
 $studentSkillsList = [];
 try {
@@ -1159,70 +1990,13 @@ try {
     ")->fetchAll();
 } catch (Exception $e) {}
 
-if (empty($studentSkillsList)) {
-    $studentSkillsList = [
-        [
-            'student_id' => '4012130045',
-            'full_name' => 'علی رضایی مقدم',
-            'national_id' => '0021487591',
-            'mobile' => '09121234567',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی کامپیوتر - هوش مصنوعی و داده',
-            'skills_concatenated' => 'پایتون (Python)، یادگیری ماشین، هوش مصنوعی، لینوکس و گیت، طراحی وب'
-        ],
-        [
-            'student_id' => '4012130046',
-            'full_name' => 'سارا احمدی',
-            'national_id' => '0019845231',
-            'mobile' => '09129876543',
-            'campus' => 'پردیس مهارت',
-            'field_of_study' => 'گرافیک و ارتباط تصویری',
-            'skills_concatenated' => 'فتوشاپ، ایلاستریتور، طراحی رابط کاربری (UI/UX)، انیمیشن دو بعدی، تدوین ویدیو'
-        ],
-        [
-            'student_id' => '4012130047',
-            'full_name' => 'امیرحسین کاظمی',
-            'national_id' => '0452318974',
-            'mobile' => '09351239988',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی برق - الکترونیک و مخابرات',
-            'skills_concatenated' => 'طراحی مدار الکترونیک، برنامه‌نویسی میکروکنترلر AVR، برق صنعتی، PLC، اتوکد الکتریکال'
-        ],
-        [
-            'student_id' => '4012130048',
-            'full_name' => 'زهرا محمدی',
-            'national_id' => '1278965412',
-            'mobile' => '09135554433',
-            'campus' => 'پردیس مهارت',
-            'field_of_study' => 'معماری و دکوراسیون داخلی',
-            'skills_concatenated' => 'اتوکد (AutoCAD)، تری‌دی مکس (3Ds Max)، طراحی پلان و دکوراسیون، رندرسازی با V-Ray، ماکت‌سازی تخصصی'
-        ],
-        [
-            'student_id' => '4012130049',
-            'full_name' => 'مهدی صادقی',
-            'national_id' => '0032541896',
-            'mobile' => '09194443322',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی صنایع و مدیریت سیستم',
-            'skills_concatenated' => 'مدیریت پروژه و MSP، اکسل پیشرفته و داشبورد مدیریتی، کنترل کیفیت آماری، برنامه‌ریزی تولید، پژوهش عملیاتی'
-        ],
-        [
-            'student_id' => '4012130050',
-            'full_name' => 'رضا باقری',
-            'national_id' => '0041258963',
-            'mobile' => '09127778899',
-            'campus' => 'پردیس فناوری',
-            'field_of_study' => 'مهندسی مکانیک و مکاترونیک',
-            'skills_concatenated' => 'سالیدورکس (SolidWorks)، کتیا (CATIA)، مکاترونیک و هیدرولیک، تراشکاری و فرزکاری، تحلیل تنش ANSYS، جوشکاری و تاسیسات'
-        ]
-    ];
-}
-
 // ۶. واکشی داده‌های سرشماری شبانه برای تاریخ جاری
-$attendance_date = $_GET['att_date'] ?? date('Y-m-d');
+$rawAttDate = trim((string)($_POST['att_date'] ?? $_GET['att_date'] ?? date('Y-m-d')));
+$attendance_date = preg_match('/^\d{4}-\d{2}-\d{2}$/', $rawAttDate) ? $rawAttDate : date('Y-m-d');
 $stmtAttendance = $pdo->prepare("
     SELECT a.student_id, s.full_name, s.national_id, s.field_of_study,
            r.room_number, r.floor,
+           att.id AS attendance_id,
            COALESCE(att.status, 'حاضر') AS attendance_status,
            att.notes AS attendance_notes,
            att.created_at AS recorded_at
@@ -1235,6 +2009,23 @@ $stmtAttendance = $pdo->prepare("
 ");
 $stmtAttendance->execute([$attendance_date]);
 $attendanceList = $stmtAttendance->fetchAll();
+
+$attDateSavedCount = 0;
+$attTotalSavedCount = 0;
+$attRecordedDates = [];
+try {
+    $stmtAttDateCnt = $pdo->prepare("SELECT COUNT(*) FROM `dorm_night_attendance` WHERE `attendance_date` = ?");
+    $stmtAttDateCnt->execute([$attendance_date]);
+    $attDateSavedCount = (int)$stmtAttDateCnt->fetchColumn();
+    $attTotalSavedCount = (int)$pdo->query("SELECT COUNT(*) FROM `dorm_night_attendance`")->fetchColumn();
+    $attRecordedDates = $pdo->query("
+        SELECT `attendance_date`, COUNT(*) AS `cnt`
+        FROM `dorm_night_attendance`
+        GROUP BY `attendance_date`
+        ORDER BY `attendance_date` DESC
+        LIMIT 30
+    ")->fetchAll();
+} catch (Exception $e) {}
 
 // آمار سرشماری
 $totalResidents = count($attendanceList);
@@ -1305,12 +2096,19 @@ foreach ($maintenanceReports as $m) {
 
 // ۱۱. واکشی داده‌های ارزیابی کیفی نظافت شبانه و محاسبه رتبه‌بندی (Cleanliness Records & Rankings)
 $cleanlinessRecords = [];
+$cleanDistinctDates = [];
 try {
     $cleanlinessRecords = $pdo->query("
         SELECT c.*, r.floor 
         FROM `room_cleanliness_records` c
         LEFT JOIN `dorm_rooms` r ON c.room_number = r.room_number
         ORDER BY c.inspection_date DESC, c.id DESC
+    ")->fetchAll();
+    $cleanDistinctDates = $pdo->query("
+        SELECT `inspection_date`, COUNT(*) AS `cnt`
+        FROM `room_cleanliness_records`
+        GROUP BY `inspection_date`
+        ORDER BY `inspection_date` DESC
     ")->fetchAll();
 } catch (Exception $e) {}
 
@@ -1394,66 +2192,49 @@ $gymBookings = [];
 $allSportsTeams = [];
 try {
     $welfareGym = $pdo->query("SELECT * FROM `welfare_services` WHERE `category` = 'gym' LIMIT 1")->fetch();
-    if (!$welfareGym) {
-        $pdo->exec("
-            INSERT INTO `welfare_services` 
-                (`title`, `category`, `location`, `hourly_rate_rials`, `slot_duration_hours`, `capacity_per_slot`, `rules_guidelines`, `is_active`)
-            VALUES 
-                ('سالن بدنسازی و پرورش اندام پردیس', 'gym', 'زیرزمین خوابگاه مرکزی صمد - سالن شماره ۱', 50000, 2, 20, 'همراه داشتن کفش ورزشی تمیز مخصوص سالن، حوله شخصی و بطری آب الزامی است.', 1)
+    if ($welfareGym && !empty($welfareGym['id'])) {
+        $stmtGymSlots = $pdo->prepare("
+            SELECT * FROM `welfare_service_slots`
+            WHERE `service_id` = ?
+            ORDER BY `slot_date_gregorian` ASC, `start_time` ASC
         ");
-        $welfareGym = $pdo->query("SELECT * FROM `welfare_services` WHERE `category` = 'gym' LIMIT 1")->fetch();
+        $stmtGymSlots->execute([(int)$welfareGym['id']]);
+        $gymSlots = $stmtGymSlots->fetchAll();
     }
-
-    // اگر سانسی برای سالن ثبت نشده باشد، به طور خودکار تولید اولیه شود
-    $slotCount = $pdo->query("SELECT COUNT(*) FROM `welfare_service_slots` WHERE `service_id` = {$welfareGym['id']}")->fetchColumn();
-    if ($slotCount == 0) {
-        // تولید سانس برای ۷ روز آینده
-        $standardSlots = [
-            ['start' => '08:00:00', 'end' => '10:00:00', 'is_blocked' => 0, 'reason' => null],
-            ['start' => '10:00:00', 'end' => '12:00:00', 'is_blocked' => 0, 'reason' => null],
-            ['start' => '12:00:00', 'end' => '14:00:00', 'is_blocked' => 1, 'reason' => 'زمان ناهار، استراحت و نظافت سالن'],
-            ['start' => '14:00:00', 'end' => '16:00:00', 'is_blocked' => 0, 'reason' => null],
-            ['start' => '16:00:00', 'end' => '18:00:00', 'is_blocked' => 0, 'reason' => null],
-            ['start' => '18:00:00', 'end' => '20:00:00', 'is_blocked' => 0, 'reason' => null],
-            ['start' => '20:00:00', 'end' => '22:00:00', 'is_blocked' => 0, 'reason' => null],
-        ];
-        $dayNamesFa = [
-            'Saturday' => 'شنبه', 'Sunday' => 'یک‌شنبه', 'Monday' => 'دوشنبه',
-            'Tuesday' => 'سه‌شنبه', 'Wednesday' => 'چهارشنبه', 'Thursday' => 'پنج‌شنبه', 'Friday' => 'جمعه'
-        ];
-        for ($i = 0; $i < 7; $i++) {
-            $ts = strtotime("+{$i} days");
-            $gDate = date('Y-m-d', $ts);
-            $dayFa = $dayNamesFa[date('l', $ts)] ?? 'نامشخص';
-            list($jy, $jm, $jd) = gregorian_to_jalali(intval(date('Y', $ts)), intval(date('m', $ts)), intval(date('d', $ts)));
-            $jDate = sprintf('%04d/%02d/%02d', $jy, $jm, $jd);
-            foreach ($standardSlots as $slot) {
-                $pdo->prepare("
-                    INSERT INTO `welfare_service_slots`
-                        (`service_id`, `slot_date_jalali`, `slot_date_gregorian`, `day_name_fa`, `start_time`, `end_time`, `duration_hours`, `total_capacity`, `booked_count`, `is_blocked`, `block_reason`)
-                    VALUES (?, ?, ?, ?, ?, ?, 2, ?, 0, ?, ?)
-                ")->execute([$welfareGym['id'], $jDate, $gDate, $dayFa, $slot['start'], $slot['end'], $welfareGym['capacity_per_slot'], $slot['is_blocked'], $slot['reason']]);
-            }
-        }
-    }
-
-    $gymSlots = $pdo->query("
-        SELECT * FROM `welfare_service_slots` 
-        WHERE `service_id` = {$welfareGym['id']} 
-        ORDER BY `slot_date_gregorian` ASC, `start_time` ASC
-    ")->fetchAll();
 
     $gymBookings = $pdo->query("
-        SELECT b.*, s.mobile, s.field_of_study 
+        SELECT b.*, s.mobile, s.field_of_study
         FROM `welfare_bookings` b
         LEFT JOIN `students` s ON b.student_id = s.student_id
         ORDER BY b.id DESC
     ")->fetchAll();
 
-    // لیست تیم‌های ورزشی موجود در دانشگاه
     $teamsQuery = $pdo->query("SELECT DISTINCT `team_name` FROM `student_sports_teams` WHERE `team_name` IS NOT NULL AND `team_name` != ''")->fetchAll(PDO::FETCH_COLUMN);
     $defaultTeams = ['تیم فوتبال دانشگاه', 'تیم فوتسال پردیس', 'تیم والیبال', 'تیم بسکتبال', 'کشتی آزاد و فرنگی', 'دو و میدانی', 'تکواندو و رزمی', 'تنیس روی میز'];
     $allSportsTeams = array_unique(array_merge($defaultTeams, $teamsQuery));
+} catch (Exception $e) {}
+
+// ۱۴. واکشی درخواست‌های اقامت میهمان دانشجویان (Guest Dormitory Requests)
+$guestDormRequests = [];
+$guestPendingCount = 0;
+try {
+    $guestDormRequests = $pdo->query("
+        SELECT gr.*,
+               COALESCE(s.full_name, gr.full_name) AS student_full_name,
+               COALESCE(s.national_id, gr.national_id) AS student_national_id,
+               COALESCE(s.mobile, gr.mobile) AS student_mobile,
+               s.campus AS student_campus,
+               COALESCE(s.field_of_study, gr.field_of_study) AS student_field,
+               COALESCE(s.study_shift, gr.study_shift) AS student_shift
+        FROM `guest_dorm_requests` gr
+        LEFT JOIN `students` s ON gr.student_id = s.student_id
+        ORDER BY FIELD(gr.status, 'pending', 'approved', 'rejected'), gr.id DESC
+    ")->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($guestDormRequests as $gdr) {
+        if (($gdr['status'] ?? '') === 'pending') {
+            $guestPendingCount++;
+        }
+    }
 } catch (Exception $e) {}
 
 // =========================================================================
@@ -1468,7 +2249,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (
     isset($_POST['action_revoke_jwt']) ||
     isset($_POST['action_revoke_role_jwts']) ||
     isset($_POST['action_refresh_my_jwt']) ||
-    isset($_POST['action_update_role_permissions'])
+    isset($_POST['action_update_role_permissions']) ||
+    isset($_POST['action_save_student_limits']) ||
+    isset($_POST['action_reset_student_action_usage']) ||
+    isset($_POST['action_reset_all_students_usage'])
 )) {
     $active_tab = 'authjwt';
     if (!samad_has_permission($jwtAuth, 'auth:tokens:manage')) {
@@ -1541,20 +2325,138 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && (
                     $updPerm = $pdo->prepare("UPDATE `auth_role_permissions` SET `is_allowed` = ? WHERE `id` = ?");
                     foreach ($rolePermRows as $rp) {
                         $permKey = $rp['permission_key'];
-                        // محافظت از حذف تصادفی مجوز حیاتی مدیر
-                        if ($editRole === 'manager' && in_array($permKey, ['auth:tokens:manage', 'dorm:rooms:manage'], true)) {
+                        // محافظت از حذف تصادفی مجوز حیاتی مدیریت توکن‌ها و RBAC
+                        if ($editRole === 'manager' && $permKey === 'auth:tokens:manage') {
                             $isAllowed = 1;
                         } else {
                             $isAllowed = in_array($permKey, $allowedKeys, true) ? 1 : 0;
                         }
                         $updPerm->execute([$isAllowed, $rp['id']]);
                     }
-                    $jwtAuth['permissions'] = samad_get_role_permissions($pdo, 'manager');
+                    $jwtAuth['permissions'] = samad_get_effective_permissions($pdo, (string)$jwtAuth['sub'], 'manager');
+                    $allowedManagerTabs = $computeAllowedManagerTabs($jwtAuth);
+                    if (!empty($allowedManagerTabs) && !in_array($active_tab, $allowedManagerTabs, true)) {
+                        $active_tab = $allowedManagerTabs[0];
+                    }
                     samad_log_auth_event($pdo, 'permission_updated', $jwtAuth['sub'], 'manager', null, 'manager_panel.php', 200, "بروزرسانی ماتریس مجوزهای RBAC برای نقش {$editRole}");
                     $msg = "ماتریس مجوزهای دسترسی (RBAC) برای نقش «{$editRole}» ذخیره و فوراً اعمال شد.";
                 } catch (Exception $e) {
                     $err = 'خطا در ذخیره مجوزها: ' . $e->getMessage();
                 }
+            }
+        }
+
+        // ۵. ذخیره تنظیمات محدودیت زمانی و تعدادی اکشن‌های دانشجو
+        if (isset($_POST['action_save_student_limits'])) {
+            try {
+                $existingLimits = samad_get_student_action_limits($pdo);
+                $submittedLimits = $_POST['limits'] ?? [];
+                if (!is_array($submittedLimits)) {
+                    $submittedLimits = [];
+                }
+                $updLimit = $pdo->prepare("
+                    UPDATE `auth_student_action_limits`
+                    SET `max_count` = ?, `window_days` = ?, `is_limit_enabled` = ?, `updated_by` = ?, `updated_at` = NOW()
+                    WHERE `action_key` = ?
+                ");
+                $updatedCnt = 0;
+                foreach ($existingLimits as $aKey => $cfg) {
+                    $rowIn = (isset($submittedLimits[$aKey]) && is_array($submittedLimits[$aKey])) ? $submittedLimits[$aKey] : [];
+                    $isEnabled = !empty($rowIn['enabled']) ? 1 : 0;
+                    $maxCount = max(0, min(100000, intval($rowIn['max_count'] ?? $cfg['max_count'])));
+                    $windowDays = max(1, min(3650, intval($rowIn['window_days'] ?? $cfg['window_days'])));
+                    $updLimit->execute([
+                        $maxCount,
+                        $windowDays,
+                        $isEnabled,
+                        substr((string)$jwtAuth['sub'], 0, 100),
+                        $aKey,
+                    ]);
+                    $updatedCnt++;
+                }
+                samad_log_auth_event($pdo, 'student_limits_updated', $jwtAuth['sub'], 'manager', $jwtAuth['jti'] ?? null, 'manager_panel.php', 200, "بروزرسانی محدودیت زمانی و تعدادی {$updatedCnt} اکشن دانشجو");
+                $msg = "محدودیت‌ها و سهمیه زمانی تمام {$updatedCnt} اکشن دانشجو با موفقیت ذخیره و فوراً اعمال شد.";
+            } catch (Exception $e) {
+                $err = 'خطا در ذخیره محدودیت‌های اکشن دانشجو: ' . $e->getMessage();
+            }
+        }
+
+        // ۶. بازنشانی مصرف سهمیه اکشن برای یک دانشجو (پشتیبانی از شماره دانشجویی، کد ملی و ارقام فارسی)
+        if (isset($_POST['action_reset_student_action_usage'])) {
+            $rawStudentInput = toEnglishDigits(trim((string)($_POST['target_student_id'] ?? '')));
+            $targetActionKey = trim((string)($_POST['target_action_key'] ?? 'all'));
+            $allLimitsMap = samad_get_student_action_limits($pdo);
+            $validActionKeys = array_keys($allLimitsMap);
+
+            if ($rawStudentInput === '') {
+                $err = 'لطفاً شماره دانشجویی یا کد ملی دانشجوی مورد نظر را برای بازنشانی سهمیه وارد یا انتخاب کنید.';
+            } elseif ($targetActionKey !== 'all' && !in_array($targetActionKey, $validActionKeys, true)) {
+                $err = 'کلید اکشن انتخاب‌شده معتبر نیست.';
+            } else {
+                try {
+                    $stmtFindStu = $pdo->prepare("SELECT `student_id`, `full_name`, `national_id` FROM `students` WHERE `student_id` = ? OR `national_id` = ? LIMIT 1");
+                    $stmtFindStu->execute([$rawStudentInput, $rawStudentInput]);
+                    $foundStu = $stmtFindStu->fetch(PDO::FETCH_ASSOC);
+
+                    $resolvedStudentId = $foundStu ? (string)$foundStu['student_id'] : $rawStudentInput;
+                    $displayLabel = $foundStu
+                        ? ($foundStu['full_name'] . ' (' . $resolvedStudentId . ')')
+                        : $resolvedStudentId;
+                    $actionTitle = ($targetActionKey === 'all')
+                        ? 'همه اکشن‌ها'
+                        : ($allLimitsMap[$targetActionKey]['action_label'] ?? $targetActionKey);
+
+                    if ($targetActionKey === 'all') {
+                        $stmtReset = $pdo->prepare("DELETE FROM `auth_student_action_logs` WHERE `student_id` = ?");
+                        $stmtReset->execute([$resolvedStudentId]);
+                    } else {
+                        $stmtReset = $pdo->prepare("DELETE FROM `auth_student_action_logs` WHERE `student_id` = ? AND `action_key` = ?");
+                        $stmtReset->execute([$resolvedStudentId, $targetActionKey]);
+                    }
+                    $deletedLogs = $stmtReset->rowCount();
+
+                    if (!$foundStu && $deletedLogs === 0) {
+                        $err = "دانشجو یا سابقه مصرفی با شماره دانشجویی یا کد ملی «{$rawStudentInput}» یافت نشد.";
+                    } else {
+                        samad_log_auth_event(
+                            $pdo,
+                            'student_limits_reset',
+                            $jwtAuth['sub'],
+                            'manager',
+                            $jwtAuth['jti'] ?? null,
+                            'manager_panel.php',
+                            200,
+                            "بازنشانی سهمیه دانشجو {$displayLabel} (اکشن: {$targetActionKey} - {$deletedLogs} رکورد حذف شد)"
+                        );
+                        if ($deletedLogs === 0) {
+                            $msg = "برای دانشجو «{$displayLabel}» در بخش «{$actionTitle}» مصرف ثبت‌شده‌ای وجود نداشت (۰ رکورد حذف شد).";
+                        } else {
+                            $msg = "مصرف سهمیه دانشجو «{$displayLabel}» در بخش «{$actionTitle}» با موفقیت بازنشانی شد ({$deletedLogs} رکورد حذف گردید).";
+                        }
+                    }
+                } catch (Exception $e) {
+                    $err = 'خطا در بازنشانی سهمیه دانشجو: ' . $e->getMessage();
+                }
+            }
+        }
+
+        // ۷. بازنشانی یکجای مصرف سهمیه تمام دانشجویان
+        if (isset($_POST['action_reset_all_students_usage'])) {
+            try {
+                $deletedAll = (int)$pdo->exec("DELETE FROM `auth_student_action_logs`");
+                samad_log_auth_event(
+                    $pdo,
+                    'student_limits_reset',
+                    $jwtAuth['sub'],
+                    'manager',
+                    $jwtAuth['jti'] ?? null,
+                    'manager_panel.php',
+                    200,
+                    "بازنشانی کلی مصرف سهمیه همه دانشجویان ({$deletedAll} رکورد حذف شد)"
+                );
+                $msg = "مصرف سهمیه تمامی دانشجویان با موفقیت بازنشانی شد ({$deletedAll} رکورد حذف گردید).";
+            } catch (Exception $e) {
+                $err = 'خطا در بازنشانی کلی مصرف دانشجویان: ' . $e->getMessage();
             }
         }
     }
@@ -1567,36 +2469,153 @@ $jwtRevokedCount = 0;
 $rbacRowsByRole = ['student' => [], 'supervisor' => [], 'manager' => []];
 $rbacActiveCount = 0;
 $authAuditLogs = [];
+$studentActionLimits = [];
+$studentRbacStatusMap = [];
+$studentActionUsageStats = [];
+$studentActionBlockStats = [];
+$rateLimitStudentsList = [];
+$studentActiveUsageByStudent = [];
 
 try {
     $jwtTokensList = $pdo->query("
         SELECT * FROM `auth_jwt_tokens`
         ORDER BY `id` DESC
-        LIMIT 80
+        LIMIT 15
     ")->fetchAll(PDO::FETCH_ASSOC);
 
     $nowTs = time();
-    foreach ($jwtTokensList as $tRow) {
-        if (empty($tRow['revoked_at']) && (int)$tRow['expires_at'] > $nowTs) {
-            $jwtActiveCount++;
-        } elseif (!empty($tRow['revoked_at'])) {
-            $jwtRevokedCount++;
-        }
-    }
+    $stmtCntActive = $pdo->prepare("SELECT COUNT(*) FROM `auth_jwt_tokens` WHERE `revoked_at` IS NULL AND `expires_at` > ?");
+    $stmtCntActive->execute([$nowTs]);
+    $jwtActiveCount = intval($stmtCntActive->fetchColumn());
+
+    $jwtRevokedCount = intval($pdo->query("SELECT COUNT(*) FROM `auth_jwt_tokens` WHERE `revoked_at` IS NOT NULL")->fetchColumn());
 
     $allRbacRows = $pdo->query("SELECT * FROM `auth_role_permissions` ORDER BY FIELD(`role`, 'student', 'supervisor', 'manager'), `id` ASC")->fetchAll(PDO::FETCH_ASSOC);
     foreach ($allRbacRows as $rRow) {
         $rbacRowsByRole[$rRow['role']][] = $rRow;
+        if ($rRow['role'] === 'student') {
+            $studentRbacStatusMap[$rRow['permission_key']] = ((int)$rRow['is_allowed'] === 1);
+        }
         if ((int)$rRow['is_allowed'] === 1) {
             $rbacActiveCount++;
         }
     }
 
     $authAuditLogs = $pdo->query("SELECT * FROM `auth_audit_logs` ORDER BY `id` DESC LIMIT 40")->fetchAll(PDO::FETCH_ASSOC);
+
+    $studentActionLimits = samad_get_student_action_limits($pdo);
+
+    try {
+        $usageRows = $pdo->query("
+            SELECT l.`action_key`,
+                   COUNT(*) AS total_hits,
+                   COUNT(DISTINCT l.`student_id`) AS unique_students
+            FROM `auth_student_action_logs` l
+            JOIN `auth_student_action_limits` cfg ON l.`action_key` = cfg.`action_key`
+            WHERE l.`created_at` >= DATE_SUB(NOW(), INTERVAL GREATEST(cfg.`window_days`, 1) DAY)
+            GROUP BY l.`action_key`
+        ")->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($usageRows as $uRow) {
+            $studentActionUsageStats[(string)$uRow['action_key']] = [
+                'hits' => (int)$uRow['total_hits'],
+                'students' => (int)$uRow['unique_students'],
+            ];
+        }
+    } catch (Exception $e) {}
+
+    try {
+        $blockedRows = $pdo->query("
+            SELECT `detail`
+            FROM `auth_audit_logs`
+            WHERE `event_type` = 'rate_limit_exceeded'
+              AND `created_at` >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+        ")->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($blockedRows as $bRow) {
+            $bDetail = (string)($bRow['detail'] ?? '');
+            foreach ($studentActionLimits as $aKey => $cfg) {
+                $needle = '(' . $cfg['action_label'] . ')';
+                if ($needle !== '()' && strpos($bDetail, $needle) !== false) {
+                    $studentActionBlockStats[$aKey] = ($studentActionBlockStats[$aKey] ?? 0) + 1;
+                    break;
+                }
+            }
+        }
+    } catch (Exception $e) {}
+
+    $studentInfoBySid = [];
+    try {
+        $rateLimitStudentsList = $pdo->query("SELECT `student_id`, `full_name`, `national_id` FROM `students` ORDER BY `full_name` ASC LIMIT 500")->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($rateLimitStudentsList as $stInfoRow) {
+            $studentInfoBySid[(string)$stInfoRow['student_id']] = $stInfoRow;
+        }
+    } catch (Exception $e) {}
+
+    try {
+        $perStuRows = $pdo->query("
+            SELECT l.`student_id`,
+                   l.`action_key`,
+                   COUNT(*) AS hits,
+                   MAX(l.`created_at`) AS last_at
+            FROM `auth_student_action_logs` l
+            JOIN `auth_student_action_limits` cfg ON l.`action_key` = cfg.`action_key`
+            WHERE l.`created_at` >= DATE_SUB(NOW(), INTERVAL GREATEST(cfg.`window_days`, 1) DAY)
+            GROUP BY l.`student_id`, l.`action_key`
+            ORDER BY MAX(l.`created_at`) DESC
+            LIMIT 200
+        ")->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($perStuRows as $psRow) {
+            $sid = (string)$psRow['student_id'];
+            $aKey = (string)$psRow['action_key'];
+            if (!isset($studentActiveUsageByStudent[$sid])) {
+                $info = $studentInfoBySid[$sid] ?? null;
+                $studentActiveUsageByStudent[$sid] = [
+                    'student_id' => $sid,
+                    'full_name' => $info ? (string)$info['full_name'] : 'دانشجو (' . $sid . ')',
+                    'national_id' => $info ? (string)$info['national_id'] : '-',
+                    'total_hits' => 0,
+                    'last_at' => (string)$psRow['last_at'],
+                    'actions' => [],
+                ];
+            }
+            $hits = (int)$psRow['hits'];
+            $studentActiveUsageByStudent[$sid]['total_hits'] += $hits;
+            if ((string)$psRow['last_at'] > $studentActiveUsageByStudent[$sid]['last_at']) {
+                $studentActiveUsageByStudent[$sid]['last_at'] = (string)$psRow['last_at'];
+            }
+            $studentActiveUsageByStudent[$sid]['actions'][] = [
+                'action_key' => $aKey,
+                'action_label' => $studentActionLimits[$aKey]['action_label'] ?? $aKey,
+                'hits' => $hits,
+                'max_count' => $studentActionLimits[$aKey]['max_count'] ?? 0,
+                'is_limit_enabled' => $studentActionLimits[$aKey]['is_limit_enabled'] ?? false,
+            ];
+        }
+    } catch (Exception $e) {}
 } catch (Exception $e) {
     if (empty($err)) {
         $err = 'خطا در واکشی اطلاعات جدول مجوزها و توکن‌های JWT: ' . $e->getMessage();
     }
+}
+
+// آماده‌سازی کاتالوگ قابلیت‌های قابل تفویض به مدیران جدید/زیرمجموعه (محدود به دسترسی‌های مدیر فعلی)
+$managerPermissionLabels = samad_manager_permission_catalog();
+$managerPermissionCatalog = [];
+foreach ($managerPermissionLabels as $permKey => $permLabel) {
+    $managerPermissionCatalog[] = [
+        'permission_key' => $permKey,
+        'permission_label' => $permLabel,
+    ];
+}
+$grantableManagerCatalog = array_values(array_filter(
+    $managerPermissionCatalog,
+    static fn($item) => samad_has_permission($jwtAuth, $item['permission_key'])
+));
+
+// بارگذاری نقشه دسترسی موثر تک‌تک مدیران (برای نمایش و ویرایش سیاست)
+$managers = $pdo->query("SELECT * FROM `admins` WHERE `role` = 'manager' ORDER BY `id` DESC")->fetchAll();
+$managerPermissionsMap = [];
+foreach ($managers as $mRow) {
+    $managerPermissionsMap[(string)$mRow['national_id']] = samad_get_effective_permissions($pdo, (string)$mRow['national_id'], 'manager');
 }
 ?>
 <!DOCTYPE html>
@@ -1643,7 +2662,7 @@ try {
                     👨‍💼
                 </div>
                 <div class="flex-1 min-w-0">
-                    <span class="text-xs font-bold text-white block truncate"><?= htmlspecialchars($_SESSION['admin_name'] ?? 'دکتر علیرضا حسینی') ?></span>
+                    <span class="text-xs font-bold text-white block truncate"><?= htmlspecialchars($_SESSION['admin_name'] ?? 'مدیر ارشد سامانه') ?></span>
                     <span class="text-[10px] text-slate-400 block truncate">مدیر امور دانشجویی دانشگاه</span>
                 </div>
             </div>
@@ -1651,13 +2670,16 @@ try {
 
         <!-- Navigation Menu Tabs -->
         <nav class="flex-1 px-3 py-2 space-y-1.5 overflow-y-auto">
+            <?php if (in_array('overview', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('overview')" id="nav-overview" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>📊</span>
                     <span>پیشخوان و آمار کلی</span>
                 </div>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('admitted', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('admitted')" id="nav-admitted" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🎓</span>
@@ -1667,7 +2689,9 @@ try {
                     <?= count($admittedStudents) ?>
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('unhoused', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('unhoused')" id="nav-unhoused" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>⏳</span>
@@ -1679,7 +2703,9 @@ try {
                     </span>
                 <?php endif; ?>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('rooms', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('rooms')" id="nav-rooms" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🏢</span>
@@ -1689,7 +2715,9 @@ try {
                     <?= count($allRooms) ?>
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('dormgraph', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('dormgraph')" id="nav-dormgraph" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🗺️</span>
@@ -1699,7 +2727,9 @@ try {
                     SRS v1.0
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('facilities', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('facilities')" id="nav-facilities" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🛋</span>
@@ -1709,7 +2739,9 @@ try {
                     <?= count(array_filter($allRooms, fn($r) => !empty($r['is_completed']))) ?>/<?= count($allRooms) ?>
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('maintenance', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('maintenance')" id="nav-maintenance" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🔧</span>
@@ -1725,7 +2757,9 @@ try {
                     </span>
                 <?php endif; ?>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('cleanliness', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('cleanliness')" id="nav-cleanliness" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>✨</span>
@@ -1735,7 +2769,9 @@ try {
                     <?= $overallCleanlinessScore ?>/۴
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('students', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('students')" id="nav-students" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🛏</span>
@@ -1745,7 +2781,27 @@ try {
                     <?= count($housedAllocations) ?>
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('guest_requests', $allowedManagerTabs, true)): ?>
+            <button type="button" onclick="switchTab('guest_requests')" id="nav-guest_requests" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
+                <div class="flex items-center gap-2.5">
+                    <span>🛎</span>
+                    <span>درخواست‌های اقامت میهمان</span>
+                </div>
+                <?php if ($guestPendingCount > 0): ?>
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-amber-500/20 text-amber-300 border border-amber-500/30 font-mono tabular-nums">
+                        <?= $guestPendingCount ?>
+                    </span>
+                <?php else: ?>
+                    <span class="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-400 font-mono tabular-nums">
+                        <?= count($guestDormRequests) ?>
+                    </span>
+                <?php endif; ?>
+            </button>
+            <?php endif; ?>
+
+            <?php if (in_array('attendance', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('attendance')" id="nav-attendance" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>📋</span>
@@ -1755,7 +2811,9 @@ try {
                     پرینت 🖨
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('supervisors', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('supervisors')" id="nav-supervisors" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🛡</span>
@@ -1765,7 +2823,9 @@ try {
                     <?= count($supervisors) + count($managers) ?>
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('festivals', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('festivals')" id="nav-festivals" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🏆</span>
@@ -1775,7 +2835,9 @@ try {
                     <?= count($studentFestivals) ?>
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('skills', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('skills')" id="nav-skills" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>✨</span>
@@ -1785,7 +2847,9 @@ try {
                     <?= count($studentSkillsList) ?>
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('welfare', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('welfare')" id="nav-welfare" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🏋️</span>
@@ -1795,7 +2859,9 @@ try {
                     <?= count($gymSlots) ?> سانس
                 </span>
             </button>
+            <?php endif; ?>
 
+            <?php if (in_array('authjwt', $allowedManagerTabs, true)): ?>
             <button type="button" onclick="switchTab('authjwt')" id="nav-authjwt" class="tab-nav-btn w-full flex items-center justify-between px-3.5 py-2.5 rounded-xl text-xs font-bold transition-all cursor-pointer text-slate-400 hover:text-white hover:bg-slate-800/60">
                 <div class="flex items-center gap-2.5">
                     <span>🔐</span>
@@ -1805,6 +2871,7 @@ try {
                     <?= $jwtActiveCount ?> فعال
                 </span>
             </button>
+            <?php endif; ?>
         </nav>
 
         <!-- Sidebar Footer -->
@@ -1826,21 +2893,14 @@ try {
                 <h2 id="top-title" class="text-xs sm:text-sm font-bold text-white">پیشخوان و داشبورد مدیریتی صمد</h2>
             </div>
             <div class="flex items-center gap-2 sm:gap-3 flex-wrap">
+                <?php if (in_array('authjwt', $allowedManagerTabs, true)): ?>
                 <button type="button" onclick="switchTab('authjwt')" class="px-2.5 py-1.5 bg-slate-900 hover:bg-slate-800 text-indigo-300 border border-slate-700 text-[11px] font-mono tabular-nums rounded-xl transition-all hidden lg:flex items-center gap-1.5 cursor-pointer" title="وضعیت توکن احراز هویت JWT">
                     <span>JWT:</span>
                     <span><?= htmlspecialchars(substr($jwtAuth['jti'], 0, 8)) ?></span>
                     <span class="text-slate-500">·</span>
                     <span class="text-emerald-400"><?= htmlspecialchars(samad_format_remaining_ttl((int)$jwtAuth['exp'])) ?></span>
                 </button>
-                <!-- میانبر تعاملی به نقش‌های دیگر سامانه -->
-                <a href="supervisor_panel.php" class="px-2.5 py-1.5 bg-amber-600/20 hover:bg-amber-600/30 text-amber-300 border border-amber-500/30 text-xs font-bold rounded-xl transition-all flex items-center gap-1">
-                    <span>🌙</span>
-                    <span class="hidden sm:inline">پنل سرپرست شب</span>
-                </a>
-                <a href="dashboard.php" class="px-2.5 py-1.5 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 text-xs font-bold rounded-xl transition-all flex items-center gap-1">
-                    <span>🎓</span>
-                    <span class="hidden sm:inline">میزکار دانشجو</span>
-                </a>
+                <?php endif; ?>
                 <a href="index.php" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-xl transition-all hidden md:flex items-center gap-1">
                     <span>🌐</span>
                     <span>پورتال اصلی</span>
@@ -1850,10 +2910,12 @@ try {
                     <span id="themeToggleIcon"><?= ($currentTheme === 'light') ? '🌙' : '☀️' ?></span>
                     <span id="themeToggleText"><?= ($currentTheme === 'light') ? 'تم دارک' : 'تم لایت' ?></span>
                 </button>
+                <?php if (in_array('attendance', $allowedManagerTabs, true)): ?>
                 <button type="button" onclick="switchTab('attendance'); setTimeout(openBatchPrintModal, 200);" class="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-600 text-white text-xs font-bold rounded-xl shadow-md transition-all cursor-pointer">
                     <span>🖨</span>
                     <span class="hidden sm:inline">چاپ سرشماری A4</span>
                 </button>
+                <?php endif; ?>
             </div>
         </header>
 
@@ -1874,6 +2936,7 @@ try {
             <?php endif; ?>
 
             <!-- ===================== TAB 1: OVERVIEW ===================== -->
+            <?php if (in_array('overview', $allowedManagerTabs, true)): ?>
             <div id="tab-overview" class="tab-pane space-y-6">
                 <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
                     <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-5 shadow-lg">
@@ -1907,7 +2970,9 @@ try {
                 <div class="bg-[#1e293b]/50 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex items-center justify-between border-b border-slate-800 pb-3">
                         <h3 class="text-sm font-bold text-white">وضعیت طبقات ساختمان خوابگاه مرکزی صمد (همکف، ۱ و ۲)</h3>
+                        <?php if (in_array('rooms', $allowedManagerTabs, true)): ?>
                         <button type="button" onclick="switchTab('rooms')" class="text-xs text-indigo-400 font-bold hover:underline">مشاهده جزئیات اتاق‌ها ←</button>
+                        <?php endif; ?>
                     </div>
 
                     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
@@ -1952,9 +3017,11 @@ try {
                         </div>
                         <div class="pt-2 border-t border-slate-800 flex items-center justify-between">
                             <span class="text-[11px] text-slate-400"><?= $resolvedMaintCount ?> مورد رفع‌شده</span>
+                            <?php if (in_array('maintenance', $allowedManagerTabs, true)): ?>
                             <button type="button" onclick="switchTab('maintenance')" class="text-xs text-rose-400 hover:text-rose-300 font-bold cursor-pointer">
                                 ورود به کارتابل ←
                             </button>
+                            <?php endif; ?>
                         </div>
                     </div>
 
@@ -1974,9 +3041,11 @@ try {
                         </div>
                         <div class="pt-2 border-t border-slate-800 flex items-center justify-between">
                             <span class="text-[11px] text-slate-400"><?= count($cleanlinessRecords) ?> نوبت ارزیابی ثبت شده</span>
+                            <?php if (in_array('cleanliness', $allowedManagerTabs, true)): ?>
                             <button type="button" onclick="switchTab('cleanliness')" class="text-xs text-emerald-400 hover:text-emerald-300 font-bold cursor-pointer">
                                 رتبه‌بندی و چاپ کارنامه ←
                             </button>
+                            <?php endif; ?>
                         </div>
                     </div>
 
@@ -1997,15 +3066,19 @@ try {
                         </div>
                         <div class="pt-2 border-t border-slate-800 flex items-center justify-between">
                             <span class="text-[11px] text-slate-400"><?= count($allRooms) - $completedCount ?> اتاق نیازمند تکمیل</span>
+                            <?php if (in_array('facilities', $allowedManagerTabs, true)): ?>
                             <button type="button" onclick="switchTab('facilities')" class="text-xs text-amber-400 hover:text-amber-300 font-bold cursor-pointer">
                                 تکمیل اطلاعات اتاق‌ها ←
                             </button>
+                            <?php endif; ?>
                         </div>
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 2: ADMITTED STUDENTS ===================== -->
+            <?php if (in_array('admitted', $allowedManagerTabs, true)): ?>
             <div id="tab-admitted" class="tab-pane hidden space-y-6">
                 <!-- فرم افزودن پذیرفته شده جدید -->
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
@@ -2109,8 +3182,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 3: UNHOUSED APPLICANTS ===================== -->
+            <?php if (in_array('unhoused', $allowedManagerTabs, true)): ?>
             <div id="tab-unhoused" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-3">
@@ -2118,10 +3193,29 @@ try {
                             <h3 class="text-sm font-bold text-white">دانشجویان متقاضی خوابگاه در انتظار اسکان (فاقد اتاق)</h3>
                             <p class="text-[11px] text-slate-400 mt-0.5">امکان اسکان فوری دانشجو به همراه تعیین زمان میهمانی با واحد روز و جستجو بر اساس کدملی</p>
                         </div>
-                        <span class="px-2.5 py-1 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full text-xs font-bold font-mono">
-                            <?= count($unhousedStudents) ?> متقاضی
-                        </span>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <?php if ($canPurgeUnhousedStudent && !empty($unhousedStudents)): ?>
+                                <button type="button" id="unhousedBulkPurgeBtn" onclick="submitSelectedUnhousedPurge()" class="hidden px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-xl text-xs font-bold transition-all cursor-pointer">
+                                    🗑 حذف کامل انتخاب‌شده‌ها (<span id="unhousedSelectedCount">0</span>)
+                                </button>
+                            <?php endif; ?>
+                            <span class="px-2.5 py-1 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full text-xs font-bold font-mono">
+                                <?= count($unhousedStudents) ?> متقاضی
+                            </span>
+                        </div>
                     </div>
+
+                    <?php if ($canPurgeUnhousedStudent): ?>
+                        <!-- Standalone forms for single and bulk complete student purge -->
+                        <form id="unhousedSinglePurgeForm" method="POST" class="hidden">
+                            <input type="hidden" name="action_purge_unhoused_student" value="1">
+                            <input type="hidden" name="student_id" id="unhousedSinglePurgeStudentId" value="">
+                        </form>
+                        <form id="unhousedBulkPurgeForm" method="POST" class="hidden">
+                            <input type="hidden" name="action_purge_selected_unhoused_students" value="1">
+                            <div id="unhousedBulkPurgeInputs"></div>
+                        </form>
+                    <?php endif; ?>
 
                     <!-- جعبه جستجو -->
                     <div class="relative">
@@ -2138,17 +3232,27 @@ try {
                             <table class="w-full text-right text-xs" id="unhousedTable">
                                 <thead>
                                     <tr class="bg-slate-900/80 text-slate-300 border-b border-slate-800">
+                                        <?php if ($canPurgeUnhousedStudent): ?>
+                                            <th class="p-3 w-10 text-center">
+                                                <input type="checkbox" id="unhousedSelectAll" onchange="toggleAllUnhousedCheckboxes(this)" class="rounded border-slate-600 bg-slate-900 text-rose-500 cursor-pointer" title="انتخاب دانشجویان برای حذف کامل">
+                                            </th>
+                                        <?php endif; ?>
                                         <th class="p-3">نام دانشجو</th>
                                         <th class="p-3">شماره دانشجویی / کدملی</th>
                                         <th class="p-3">رشته و نوبت تحصیلی</th>
                                         <th class="p-3">محل سکونت</th>
                                         <th class="p-3">توضیحات دانشجو</th>
-                                        <th class="p-3 text-center">عملیات اسکان</th>
+                                        <th class="p-3 text-center">عملیات اسکان / حذف کلی</th>
                                     </tr>
                                 </thead>
                                 <tbody class="divide-y divide-slate-800">
                                     <?php foreach ($unhousedStudents as $std): ?>
                                         <tr class="hover:bg-slate-800/40 unhoused-row" data-search="<?= htmlspecialchars(strtolower($std['full_name'] . ' ' . $std['national_id'] . ' ' . $std['student_id'] . ' ' . $std['province'] . ' ' . $std['city'] . ' ' . $std['field_of_study'])) ?>">
+                                            <?php if ($canPurgeUnhousedStudent): ?>
+                                                <td class="p-3 text-center">
+                                                    <input type="checkbox" class="unhoused-row-check rounded border-slate-600 bg-slate-900 text-rose-500 cursor-pointer" value="<?= htmlspecialchars($std['student_id']) ?>" onchange="updateUnhousedSelectedCount()">
+                                                </td>
+                                            <?php endif; ?>
                                             <td class="p-3 font-bold text-white"><?= htmlspecialchars($std['full_name']) ?></td>
                                             <td class="p-3 font-mono">
                                                 <span class="text-indigo-400 font-bold block"><?= htmlspecialchars($std['student_id']) ?></span>
@@ -2161,9 +3265,16 @@ try {
                                             <td class="p-3 text-slate-300"><?= htmlspecialchars($std['province']) ?> (<?= htmlspecialchars($std['city']) ?>)</td>
                                             <td class="p-3 text-[11px] text-slate-400"><?= htmlspecialchars($std['dormitory_note'] ?? 'متقاضی خوابگاه') ?></td>
                                             <td class="p-3 text-center">
-                                                <button type="button" onclick="openAssignModal('<?= htmlspecialchars($std['student_id']) ?>', '<?= htmlspecialchars($std['full_name']) ?>', '<?= htmlspecialchars($std['study_shift']) ?>')" class="px-3 py-1.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-slate-950 text-xs font-bold rounded-xl shadow-md transition-all cursor-pointer">
-                                                    اسکان در اتاق ←
-                                                </button>
+                                                <div class="inline-flex items-center gap-1.5 flex-wrap justify-center">
+                                                    <button type="button" onclick="openAssignModal('<?= htmlspecialchars($std['student_id'], ENT_QUOTES) ?>', '<?= htmlspecialchars($std['full_name'], ENT_QUOTES) ?>', '<?= htmlspecialchars($std['study_shift'], ENT_QUOTES) ?>')" class="px-3 py-1.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-slate-950 text-xs font-bold rounded-xl shadow-md transition-all cursor-pointer">
+                                                        اسکان در اتاق ←
+                                                    </button>
+                                                    <?php if ($canPurgeUnhousedStudent): ?>
+                                                        <button type="button" onclick="purgeSingleUnhousedStudent('<?= htmlspecialchars($std['student_id'], ENT_QUOTES) ?>', '<?= htmlspecialchars($std['full_name'], ENT_QUOTES) ?>')" class="px-2.5 py-1.5 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-xl text-xs font-bold transition-all cursor-pointer" title="حذف کامل دانشجو از کل سامانه و تمامی جداول پایگاه داده">
+                                                            🗑 حذف کلی
+                                                        </button>
+                                                    <?php endif; ?>
+                                                </div>
                                             </td>
                                         </tr>
                                     <?php endforeach; ?>
@@ -2173,8 +3284,10 @@ try {
                     <?php endif; ?>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB: DORMITORY GRAPH (مدیر دانشگاه) ===================== -->
+            <?php if (in_array('dormgraph', $allowedManagerTabs, true)): ?>
             <div id="tab-dormgraph" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-slate-800 pb-4">
@@ -2212,8 +3325,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 4: ROOMS ===================== -->
+            <?php if (in_array('rooms', $allowedManagerTabs, true)): ?>
             <div id="tab-rooms" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-3">
@@ -2376,8 +3491,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB: FACILITIES (امکانات و تجهیزات اتاق‌ها) ===================== -->
+            <?php if (in_array('facilities', $allowedManagerTabs, true)): ?>
             <div id="tab-facilities" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-3">
@@ -2504,8 +3621,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB: MAINTENANCE (کارتابل خرابی و فاکتورها) ===================== -->
+            <?php if (in_array('maintenance', $allowedManagerTabs, true)): ?>
             <div id="tab-maintenance" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-3">
@@ -2669,8 +3788,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB: CLEANLINESS (ارزیابی نظافت و رتبه‌بندی) ===================== -->
+            <?php if (in_array('cleanliness', $allowedManagerTabs, true)): ?>
             <div id="tab-cleanliness" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-3">
@@ -2681,7 +3802,26 @@ try {
                             </h3>
                             <p class="text-[11px] text-slate-400 mt-0.5">پایش ارزیابی شب به شب سرپرستان در ۴ سطح کیفی (عالی، خوب، متوسط، ضعیف) و صدور کارنامه رسمی چاپی با سربرگ دانشگاه</p>
                         </div>
-                        <div class="flex items-center gap-2">
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <select id="cleanExportRoom" class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs outline-none">
+                                <option value="all">کل خوابگاه (همه اتاق‌ها)</option>
+                                <?php foreach ($allRooms as $rmEx): ?>
+                                    <option value="<?= htmlspecialchars($rmEx['room_number']) ?>">اتاق <?= htmlspecialchars($rmEx['room_number']) ?> (<?= htmlspecialchars($rmEx['floor']) ?>)</option>
+                                <?php endforeach; ?>
+                            </select>
+                            <select id="cleanExportRange" class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs outline-none">
+                                <option value="1d">۱ روزه</option>
+                                <option value="3d">۳ روزه</option>
+                                <option value="7d" selected>۷ روزه</option>
+                                <option value="15d">۱۵ روزه</option>
+                                <option value="1m">۱ ماهه</option>
+                                <option value="3m">۳ ماهه</option>
+                                <option value="6m">۶ ماهه</option>
+                            </select>
+                            <button type="button" onclick="exportDormReportExcel('cleanliness', 'cleanExportRoom', 'cleanExportRange')" class="flex items-center gap-1.5 px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold rounded-xl shadow-md transition-all cursor-pointer">
+                                <span>📊</span>
+                                <span>دریافت اکسل نظافت</span>
+                            </button>
                             <button type="button" onclick="openCleanlinessPrintModal()" class="flex items-center gap-1.5 px-3 py-1.5 bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-600 text-white text-xs font-bold rounded-xl shadow-md transition-all cursor-pointer">
                                 <span>چاپ کارنامه رسمی بهداشت A4 🖨</span>
                             </button>
@@ -2723,18 +3863,63 @@ try {
                         </div>
                     </div>
 
-                    <!-- Cleanliness View Mode Toggle -->
-                    <div class="flex items-center justify-between border-b border-slate-800 pb-3 pt-2">
-                        <div class="flex items-center gap-2">
+                    <!-- Cleanliness View Mode Toggle & Deletion Controls -->
+                    <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-3 border-b border-slate-800 pb-3 pt-2">
+                        <div class="flex items-center gap-2 flex-wrap">
                             <button type="button" onclick="switchCleanView('ranking')" id="btn-clean-ranking" class="px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-600 text-white cursor-pointer transition-all">
                                 🏆 جدول رتبه‌بندی عملکرد اتاق‌ها
                             </button>
                             <button type="button" onclick="switchCleanView('history')" id="btn-clean-history" class="px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-800 text-slate-300 hover:text-white cursor-pointer transition-all">
                                 📅 تاریخچه بازرسی‌های ثبت‌شده
                             </button>
+                            <span class="text-xs text-slate-400 font-mono mr-1"><?= count($cleanlinessRecords) ?> رکورد بازرسی</span>
                         </div>
-                        <span class="text-xs text-slate-400 font-mono"><?= count($cleanlinessRecords) ?> رکورد بازرسی</span>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <?php if (!empty($cleanDistinctDates)): ?>
+                                <form method="POST" class="flex items-center gap-1.5" onsubmit="return confirm('آیا از حذف تمامی گزارش‌های نظافت تاریخ انتخاب‌شده اطمینان دارید؟');">
+                                    <input type="hidden" name="action_delete_date_cleanliness" value="1">
+                                    <input type="hidden" name="clean_view" id="cleanDeleteDateViewInput" value="<?= htmlspecialchars($cleanViewMode) ?>">
+                                    <select name="inspection_date" class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs font-mono outline-none">
+                                        <?php foreach ($cleanDistinctDates as $cd): ?>
+                                            <option value="<?= htmlspecialchars($cd['inspection_date']) ?>">
+                                                <?= htmlspecialchars($cd['inspection_date']) ?> (<?= (int)$cd['cnt'] ?> مورد)
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                    <button type="submit" class="px-2.5 py-1.5 bg-amber-600/20 hover:bg-amber-600 text-amber-300 hover:text-white border border-amber-500/30 rounded-xl text-xs font-bold transition-all cursor-pointer">
+                                        🗑 حذف نظافت این تاریخ
+                                    </button>
+                                </form>
+                            <?php endif; ?>
+                            <button type="button" id="cleanBulkSelectedBtn" onclick="submitSelectedCleanlinessDelete()" class="hidden px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-xl text-xs font-bold transition-all cursor-pointer">
+                                🗑 حذف موارد انتخاب‌شده (<span id="cleanSelectedCount">0</span>)
+                            </button>
+                            <form method="POST" onsubmit="return confirm('هشدار: تمامی سوابق ارزیابی نظافت اتاق‌ها در کل تاریخ‌ها حذف خواهند شد. آیا ادامه می‌دهید؟');">
+                                <input type="hidden" name="action_delete_all_cleanliness" value="1">
+                                <input type="hidden" name="clean_view" id="cleanDeleteAllViewInput" value="<?= htmlspecialchars($cleanViewMode) ?>">
+                                <button type="submit" <?= empty($cleanlinessRecords) ? 'disabled' : '' ?> class="px-3 py-1.5 rounded-xl text-xs font-bold border transition-all <?= empty($cleanlinessRecords) ? 'bg-slate-800/60 text-slate-500 border-slate-700 cursor-not-allowed' : 'bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border-rose-500/30 cursor-pointer' ?>">
+                                    🗑 حذف کل سوابق نظافت (<?= count($cleanlinessRecords) ?>)
+                                </button>
+                            </form>
+                        </div>
                     </div>
+
+                    <!-- Standalone Cleanliness Delete Forms (no nested forms inside tables) -->
+                    <form id="cleanSingleDeleteForm" method="POST" class="hidden">
+                        <input type="hidden" name="action_delete_cleanliness_record" value="1">
+                        <input type="hidden" name="record_id" id="cleanSingleDeleteId" value="">
+                        <input type="hidden" name="clean_view" value="history">
+                    </form>
+                    <form id="cleanRoomDeleteForm" method="POST" class="hidden">
+                        <input type="hidden" name="action_delete_room_cleanliness" value="1">
+                        <input type="hidden" name="room_number" id="cleanRoomDeleteNumber" value="">
+                        <input type="hidden" name="clean_view" value="ranking">
+                    </form>
+                    <form id="cleanBulkDeleteForm" method="POST" class="hidden">
+                        <input type="hidden" name="action_delete_selected_cleanliness" value="1">
+                        <input type="hidden" name="clean_view" value="history">
+                        <div id="cleanBulkDeleteInputs"></div>
+                    </form>
 
                     <!-- 1. Ranking Table View -->
                     <div id="cleanViewRanking" class="overflow-x-auto">
@@ -2748,6 +3933,7 @@ try {
                                     <th class="p-3">تعداد بازرسی‌ها</th>
                                     <th class="p-3">تفکیک ارزیابی‌ها</th>
                                     <th class="p-3 text-center">وضعیت بهداشتی</th>
+                                    <th class="p-3 text-center">عملیات حذف</th>
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-slate-800">
@@ -2805,6 +3991,15 @@ try {
                                                 </span>
                                             <?php endif; ?>
                                         </td>
+                                        <td class="p-3 text-center">
+                                            <?php if ((int)$rk['inspections_count'] > 0): ?>
+                                                <button type="button" onclick="deleteRoomCleanliness('<?= htmlspecialchars($rk['room_number'], ENT_QUOTES) ?>', <?= (int)$rk['inspections_count'] ?>)" class="px-2.5 py-1 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-lg text-[11px] font-bold transition-colors cursor-pointer">
+                                                    🗑 حذف سوابق اتاق
+                                                </button>
+                                            <?php else: ?>
+                                                <span class="text-[11px] text-slate-500">بدون سابقه</span>
+                                            <?php endif; ?>
+                                        </td>
                                     </tr>
                                     <?php $rankIdx++; ?>
                                 <?php endforeach; ?>
@@ -2817,21 +4012,28 @@ try {
                         <table class="w-full text-right text-xs">
                             <thead>
                                 <tr class="bg-slate-900/80 text-slate-300 border-b border-slate-800">
+                                    <th class="p-3 w-10 text-center">
+                                        <input type="checkbox" id="cleanSelectAll" onchange="toggleAllCleanCheckboxes(this)" class="rounded border-slate-600 bg-slate-900 text-rose-500 cursor-pointer">
+                                    </th>
                                     <th class="p-3">تاریخ بازرسی</th>
                                     <th class="p-3">اتاق و طبقه</th>
                                     <th class="p-3">درجه کیفی نظافت</th>
                                     <th class="p-3">سرپرست ارزیاب</th>
                                     <th class="p-3">یادداشت و مشاهدات</th>
+                                    <th class="p-3 text-center">عملیات</th>
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-slate-800">
                                 <?php if (empty($cleanlinessRecords)): ?>
                                     <tr>
-                                        <td colspan="5" class="p-6 text-center text-slate-400">سابقه‌ای ثبت نشده است.</td>
+                                        <td colspan="7" class="p-6 text-center text-slate-400">سابقه‌ای ثبت نشده است.</td>
                                     </tr>
                                 <?php else: ?>
                                     <?php foreach ($cleanlinessRecords as $cr): ?>
                                         <tr class="hover:bg-slate-800/40">
+                                            <td class="p-3 text-center">
+                                                <input type="checkbox" class="clean-row-check rounded border-slate-600 bg-slate-900 text-rose-500 cursor-pointer" value="<?= (int)$cr['id'] ?>" onchange="updateCleanSelectedCount()">
+                                            </td>
                                             <td class="p-3 font-mono text-slate-300"><?= htmlspecialchars($cr['inspection_date']) ?></td>
                                             <td class="p-3 font-bold text-white font-mono">اتاق <?= htmlspecialchars($cr['room_number']) ?> (<?= htmlspecialchars($cr['floor'] ?? '') ?>)</td>
                                             <td class="p-3">
@@ -2850,6 +4052,11 @@ try {
                                             </td>
                                             <td class="p-3 text-slate-300"><?= htmlspecialchars($cr['supervisor_name'] ?? 'سرپرست شیفت شب') ?></td>
                                             <td class="p-3 text-slate-400"><?= htmlspecialchars($cr['notes'] ?? '-') ?></td>
+                                            <td class="p-3 text-center">
+                                                <button type="button" onclick="deleteSingleCleanliness(<?= (int)$cr['id'] ?>, '<?= htmlspecialchars($cr['room_number'], ENT_QUOTES) ?>', '<?= htmlspecialchars($cr['inspection_date'], ENT_QUOTES) ?>')" class="px-2.5 py-1 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-lg text-[11px] font-bold transition-colors cursor-pointer">
+                                                    🗑 حذف
+                                                </button>
+                                            </td>
                                         </tr>
                                     <?php endforeach; ?>
                                 <?php endif; ?>
@@ -2858,8 +4065,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 5: HOUSED STUDENTS ===================== -->
+            <?php if (in_array('students', $allowedManagerTabs, true)): ?>
             <div id="tab-students" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-3">
@@ -2957,8 +4166,163 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
+
+            <!-- ===================== TAB 5.5: GUEST DORMITORY REQUESTS ===================== -->
+            <?php if (in_array('guest_requests', $allowedManagerTabs, true)): ?>
+            <div id="tab-guest_requests" class="tab-pane hidden space-y-6">
+                <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
+                    <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-4">
+                        <div>
+                            <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                                <span>🛎</span>
+                                <span>کارتابل بررسی و تایید درخواست‌های اقامت میهمان دانشجویان</span>
+                            </h3>
+                            <p class="text-[11px] text-slate-400 mt-0.5">
+                                دانشجویانی که حتی از پیش متقاضی خوابگاه نبوده‌اند می‌توانند درخواست اقامت موقت میهمان ثبت کنند. هنگام تایید، اتاق و مدت اقامت همزمان تخصیص داده می‌شود.
+                            </p>
+                        </div>
+                        <div class="flex items-center gap-2 shrink-0">
+                            <span class="px-2.5 py-1 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded-full text-xs font-mono font-bold tabular-nums">
+                                <?= $guestPendingCount ?> در انتظار بررسی
+                            </span>
+                            <span class="px-2.5 py-1 bg-slate-800 text-slate-300 rounded-full text-xs font-mono font-bold tabular-nums">
+                                کل: <?= count($guestDormRequests) ?>
+                            </span>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+                        <input type="text" id="guestReqSearchInput" oninput="filterGuestRequestsTable()" placeholder="جستجو بر اساس نام، شماره دانشجویی، کد ملی یا شرح مشکل..." class="flex-1 px-3.5 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs outline-none focus:border-indigo-500">
+                        <select id="guestReqStatusFilter" onchange="filterGuestRequestsTable()" class="px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs outline-none">
+                            <option value="all">همه وضعیت‌ها</option>
+                            <option value="pending">در انتظار بررسی</option>
+                            <option value="approved">تایید شده</option>
+                            <option value="rejected">رد شده</option>
+                        </select>
+                    </div>
+
+                    <?php if (empty($guestDormRequests)): ?>
+                        <div class="p-8 text-center bg-slate-900/50 border border-slate-800 rounded-2xl text-xs text-slate-400">
+                            تاکنون هیچ درخواست اقامت میهمانی توسط دانشجویان ثبت نشده است.
+                        </div>
+                    <?php else: ?>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-right text-xs" id="guestRequestsTable">
+                                <thead>
+                                    <tr class="bg-slate-900/80 text-slate-300 border-b border-slate-800">
+                                        <th class="p-3">مشخصات دانشجو</th>
+                                        <th class="p-3">سابقه تقاضای خوابگاه</th>
+                                        <th class="p-3">شرح مشکل و درخواست</th>
+                                        <th class="p-3 text-center">مدت درخواستی</th>
+                                        <th class="p-3 text-center">وضعیت و نتیجه</th>
+                                        <th class="p-3 text-center">اقدام مدیر</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-800">
+                                    <?php foreach ($guestDormRequests as $gdr):
+                                        $gStatus = (string)($gdr['status'] ?? 'pending');
+                                        $wasApp = ((int)($gdr['was_dorm_applicant'] ?? 0) === 1);
+                                        $hasAlloc = ((int)($gdr['has_active_allocation'] ?? 0) === 1);
+                                        $sText = strtolower(($gdr['student_full_name'] ?? '') . ' ' . ($gdr['student_id'] ?? '') . ' ' . ($gdr['student_national_id'] ?? '') . ' ' . ($gdr['problem_description'] ?? ''));
+                                    ?>
+                                        <tr class="hover:bg-slate-800/40 guest-req-row" data-status="<?= htmlspecialchars($gStatus) ?>" data-search="<?= htmlspecialchars($sText) ?>">
+                                            <td class="p-3 align-top">
+                                                <div class="font-bold text-white"><?= htmlspecialchars((string)($gdr['student_full_name'] ?? '')) ?></div>
+                                                <div class="text-[11px] font-mono text-indigo-300 mt-0.5 tabular-nums">
+                                                    <?= htmlspecialchars((string)$gdr['student_id']) ?> · <?= htmlspecialchars((string)($gdr['student_national_id'] ?? '')) ?>
+                                                </div>
+                                                <div class="text-[10px] text-slate-400 mt-0.5">
+                                                    <?= htmlspecialchars((string)($gdr['student_field'] ?? '-')) ?>
+                                                    <?php if (!empty($gdr['student_mobile'])): ?>
+                                                        · <span class="font-mono"><?= htmlspecialchars((string)$gdr['student_mobile']) ?></span>
+                                                    <?php endif; ?>
+                                                </div>
+                                            </td>
+                                            <td class="p-3 align-top">
+                                                <?php if (!$wasApp): ?>
+                                                    <span class="inline-block px-2 py-1 rounded-lg bg-amber-950/80 text-amber-300 border border-amber-500/40 text-[10px] font-bold leading-snug">
+                                                        متقاضی خوابگاه از پیش نبوده (درخواست موقت میهمان)
+                                                    </span>
+                                                <?php elseif ($hasAlloc): ?>
+                                                    <span class="inline-block px-2 py-1 rounded-lg bg-indigo-950/70 text-indigo-300 border border-indigo-500/30 text-[10px] font-bold">
+                                                        متقاضی قبلی (دارای اسکان فعال در زمان ثبت)
+                                                    </span>
+                                                <?php else: ?>
+                                                    <span class="inline-block px-2 py-1 rounded-lg bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-bold">
+                                                        در صف متقاضیان خوابگاه بود
+                                                    </span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="p-3 align-top max-w-sm">
+                                                <p class="text-slate-200 leading-relaxed whitespace-pre-line text-[11px]"><?= htmlspecialchars((string)($gdr['problem_description'] ?? '')) ?></p>
+                                                <span class="text-[10px] text-slate-500 font-mono block mt-1">ثبت: <?= htmlspecialchars((string)($gdr['created_at'] ?? '')) ?></span>
+                                                <?php if (!empty($gdr['manager_note'])): ?>
+                                                    <div class="mt-1.5 p-2 rounded-lg bg-slate-900/90 border border-slate-700 text-[10px] text-slate-300">
+                                                        <strong class="text-indigo-300">یادداشت مدیر:</strong> <?= htmlspecialchars((string)$gdr['manager_note']) ?>
+                                                    </div>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="p-3 text-center align-top font-mono font-bold text-amber-300 tabular-nums whitespace-nowrap">
+                                                <?= intval($gdr['requested_days'] ?? 7) ?> روز
+                                            </td>
+                                            <td class="p-3 text-center align-top">
+                                                <?php if ($gStatus === 'approved'): ?>
+                                                    <span class="inline-block px-2.5 py-1 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-[10px] font-bold whitespace-nowrap">
+                                                        تایید شده (اتاق <?= htmlspecialchars((string)($gdr['assigned_room_number'] ?? '-')) ?> · <?= intval($gdr['approved_days'] ?? 0) ?> روز)
+                                                    </span>
+                                                    <?php if (!empty($gdr['reviewed_by_name'])): ?>
+                                                        <span class="block text-[10px] text-slate-400 mt-1">توسط: <?= htmlspecialchars((string)$gdr['reviewed_by_name']) ?></span>
+                                                    <?php endif; ?>
+                                                <?php elseif ($gStatus === 'rejected'): ?>
+                                                    <span class="inline-block px-2.5 py-1 rounded-lg bg-rose-500/20 text-rose-300 border border-rose-500/40 text-[10px] font-bold whitespace-nowrap">
+                                                        رد شده
+                                                    </span>
+                                                    <?php if (!empty($gdr['reviewed_by_name'])): ?>
+                                                        <span class="block text-[10px] text-slate-400 mt-1">توسط: <?= htmlspecialchars((string)$gdr['reviewed_by_name']) ?></span>
+                                                    <?php endif; ?>
+                                                <?php else: ?>
+                                                    <span class="inline-block px-2.5 py-1 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-bold whitespace-nowrap">
+                                                        در انتظار بررسی
+                                                    </span>
+                                                <?php endif; ?>
+                                            </td>
+                                            <td class="p-3 text-center align-top">
+                                                <?php if ($gStatus === 'pending'): ?>
+                                                    <div class="flex items-center justify-center gap-1.5 flex-wrap">
+                                                        <button type="button"
+                                                            onclick='openGuestApproveModal(<?= json_encode([
+                                                                "id" => (int)$gdr["id"],
+                                                                "student_id" => (string)$gdr["student_id"],
+                                                                "full_name" => (string)($gdr["student_full_name"] ?? ""),
+                                                                "requested_days" => (int)($gdr["requested_days"] ?? 7),
+                                                                "was_dorm_applicant" => $wasApp ? 1 : 0,
+                                                            ], JSON_UNESCAPED_UNICODE) ?>)'
+                                                            class="px-2.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-[11px] font-bold transition-all cursor-pointer whitespace-nowrap shrink-0">
+                                                            تایید و تخصیص اتاق
+                                                        </button>
+                                                        <button type="button"
+                                                            onclick='openGuestRejectModal(<?= (int)$gdr["id"] ?>, <?= json_encode((string)($gdr["student_full_name"] ?? ""), JSON_UNESCAPED_UNICODE) ?>)'
+                                                            class="px-2.5 py-1.5 bg-rose-500/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-lg text-[11px] font-bold transition-all cursor-pointer whitespace-nowrap shrink-0">
+                                                            رد درخواست
+                                                        </button>
+                                                    </div>
+                                                <?php else: ?>
+                                                    <span class="text-[11px] text-slate-500">تعیین تکلیف شده</span>
+                                                <?php endif; ?>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+                    <?php endif; ?>
+                </div>
+            </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 6: NIGHT ATTENDANCE ===================== -->
+            <?php if (in_array('attendance', $allowedManagerTabs, true)): ?>
             <div id="tab-attendance" class="tab-pane hidden space-y-6">
                 <!-- Attendance Metrics Bar -->
                 <div class="grid grid-cols-2 sm:grid-cols-5 gap-3.5 no-print">
@@ -2990,7 +4354,26 @@ try {
                             <h3 class="text-sm font-bold text-white">بررسی سرشماری شبانه خوابگاه و کارنامه تردد</h3>
                             <p class="text-[11px] text-slate-400 mt-0.5">ثبت‌شده توسط سرپرست خوابگاه با قابلیت پرینت فردی و کلی</p>
                         </div>
-                        <div class="flex items-center gap-2">
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <select id="attExportRoom" class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs outline-none">
+                                <option value="all">کل خوابگاه (همه اتاق‌ها)</option>
+                                <?php foreach ($allRooms as $rmEx): ?>
+                                    <option value="<?= htmlspecialchars($rmEx['room_number']) ?>">اتاق <?= htmlspecialchars($rmEx['room_number']) ?> (<?= htmlspecialchars($rmEx['floor']) ?>)</option>
+                                <?php endforeach; ?>
+                            </select>
+                            <select id="attExportRange" class="px-2.5 py-1.5 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs outline-none">
+                                <option value="1d" selected>۱ روزه</option>
+                                <option value="3d">۳ روزه</option>
+                                <option value="7d">۷ روزه</option>
+                                <option value="15d">۱۵ روزه</option>
+                                <option value="1m">۱ ماهه</option>
+                                <option value="3m">۳ ماهه</option>
+                                <option value="6m">۶ ماهه</option>
+                            </select>
+                            <button type="button" onclick="exportDormReportExcel('attendance', 'attExportRoom', 'attExportRange')" class="flex items-center gap-1.5 px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold rounded-xl shadow-md transition-all cursor-pointer">
+                                <span>📊</span>
+                                <span>دریافت اکسل سرشماری</span>
+                            </button>
                             <form method="GET" class="flex items-center gap-2">
                                 <input type="hidden" name="tab" value="attendance">
                                 <input type="date" name="att_date" value="<?= htmlspecialchars($attendance_date) ?>" onchange="this.form.submit()" class="px-3 py-1.5 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs font-mono">
@@ -3000,6 +4383,65 @@ try {
                             </button>
                         </div>
                     </div>
+
+                    <!-- نوار مدیریت و حذف سوابق سرشماری (تکی / تاریخ مشخص / کلی) -->
+                    <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-3 bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+                        <div class="flex items-center gap-3 flex-wrap text-xs">
+                            <span class="text-slate-300">
+                                رکوردهای ثبت‌شده تاریخ <span class="font-mono font-bold text-indigo-300"><?= htmlspecialchars($attendance_date) ?></span>:
+                                <strong class="font-mono text-white"><?= $attDateSavedCount ?> مورد</strong>
+                            </span>
+                            <span class="text-slate-600">|</span>
+                            <span class="text-slate-400">
+                                کل سوابق ذخیره‌شده: <strong class="font-mono text-slate-200"><?= $attTotalSavedCount ?> رکورد</strong>
+                            </span>
+                            <?php if (!empty($attRecordedDates)): ?>
+                                <form method="GET" class="flex items-center gap-1.5">
+                                    <input type="hidden" name="tab" value="attendance">
+                                    <select name="att_date" onchange="this.form.submit()" class="px-2.5 py-1 bg-slate-900 border border-slate-700 text-slate-200 rounded-lg text-[11px] font-mono outline-none">
+                                        <option value="<?= htmlspecialchars($attendance_date) ?>">📅 تاریخ‌های دارای سرشماری...</option>
+                                        <?php foreach ($attRecordedDates as $rd): ?>
+                                            <option value="<?= htmlspecialchars($rd['attendance_date']) ?>" <?= $rd['attendance_date'] === $attendance_date ? 'selected' : '' ?>>
+                                                <?= htmlspecialchars($rd['attendance_date']) ?> (<?= (int)$rd['cnt'] ?> رکورد)
+                                            </option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </form>
+                            <?php endif; ?>
+                        </div>
+                        <div class="flex items-center gap-2 flex-wrap">
+                            <button type="button" id="attBulkSelectedBtn" onclick="submitSelectedAttendanceDelete()" class="hidden px-3 py-1.5 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-xl text-xs font-bold transition-all cursor-pointer">
+                                🗑 حذف موارد انتخاب‌شده (<span id="attSelectedCount">0</span>)
+                            </button>
+                            <form method="POST" onsubmit="return confirm('آیا از حذف تمامی رکوردهای سرشماری تاریخ <?= htmlspecialchars($attendance_date, ENT_QUOTES) ?> اطمینان دارید؟');">
+                                <input type="hidden" name="action_delete_date_attendance" value="1">
+                                <input type="hidden" name="att_date" value="<?= htmlspecialchars($attendance_date) ?>">
+                                <input type="hidden" name="target_att_date" value="<?= htmlspecialchars($attendance_date) ?>">
+                                <button type="submit" <?= $attDateSavedCount === 0 ? 'disabled' : '' ?> class="px-3 py-1.5 rounded-xl text-xs font-bold border transition-all <?= $attDateSavedCount === 0 ? 'bg-slate-800/60 text-slate-500 border-slate-700 cursor-not-allowed' : 'bg-amber-600/20 hover:bg-amber-600 text-amber-300 hover:text-white border-amber-500/30 cursor-pointer' ?>">
+                                    🗑 حذف سرشماری این تاریخ (<?= $attDateSavedCount ?>)
+                                </button>
+                            </form>
+                            <form method="POST" onsubmit="return confirm('هشدار: تمامی سوابق سرشماری شبانه در کل تاریخ‌ها حذف خواهند شد. آیا ادامه می‌دهید؟');">
+                                <input type="hidden" name="action_delete_all_attendance" value="1">
+                                <input type="hidden" name="att_date" value="<?= htmlspecialchars($attendance_date) ?>">
+                                <button type="submit" <?= $attTotalSavedCount === 0 ? 'disabled' : '' ?> class="px-3 py-1.5 rounded-xl text-xs font-bold border transition-all <?= $attTotalSavedCount === 0 ? 'bg-slate-800/60 text-slate-500 border-slate-700 cursor-not-allowed' : 'bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border-rose-500/30 cursor-pointer' ?>">
+                                    🗑 حذف کل سوابق سرشماری (<?= $attTotalSavedCount ?>)
+                                </button>
+                            </form>
+                        </div>
+                    </div>
+
+                    <!-- Standalone Attendance Delete Forms (no nested forms inside table) -->
+                    <form id="attSingleDeleteForm" method="POST" class="hidden">
+                        <input type="hidden" name="action_delete_attendance_record" value="1">
+                        <input type="hidden" name="attendance_id" id="attSingleDeleteId" value="">
+                        <input type="hidden" name="att_date" value="<?= htmlspecialchars($attendance_date) ?>">
+                    </form>
+                    <form id="attBulkDeleteForm" method="POST" class="hidden">
+                        <input type="hidden" name="action_delete_selected_attendance" value="1">
+                        <input type="hidden" name="att_date" value="<?= htmlspecialchars($attendance_date) ?>">
+                        <div id="attBulkDeleteInputs"></div>
+                    </form>
 
                     <!-- Attendance Filters & Search with National ID -->
                     <div class="flex flex-col sm:flex-row gap-3 items-stretch sm:items-center justify-between pt-1">
@@ -3028,17 +4470,28 @@ try {
                         <table class="w-full text-right text-xs" id="attendanceTable">
                             <thead>
                                 <tr class="bg-slate-900/80 text-slate-300 border-b border-slate-800">
+                                    <th class="p-3 w-10 text-center">
+                                        <input type="checkbox" id="attSelectAll" onchange="toggleAllAttCheckboxes(this)" class="rounded border-slate-600 bg-slate-900 text-rose-500 cursor-pointer" title="انتخاب رکوردهای ثبت‌شده">
+                                    </th>
                                     <th class="p-3">دانشجو</th>
                                     <th class="p-3">شماره دانشجویی / کدملی</th>
                                     <th class="p-3">اتاق و طبقه</th>
                                     <th class="p-3">وضعیت سرشماری</th>
                                     <th class="p-3">توضیحات سرپرست</th>
-                                    <th class="p-3 text-center">چاپ کارنامه تردد / پرینت فردی</th>
+                                    <th class="p-3 text-center">چاپ / حذف رکورد</th>
                                 </tr>
                             </thead>
                             <tbody class="divide-y divide-slate-800">
                                 <?php foreach ($attendanceList as $att): ?>
+                                    <?php $hasAttRecord = !empty($att['attendance_id']); ?>
                                     <tr class="hover:bg-slate-800/40 att-row" data-floor="<?= htmlspecialchars($att['floor']) ?>" data-status="<?= htmlspecialchars($att['attendance_status']) ?>" data-search="<?= htmlspecialchars(strtolower($att['full_name'] . ' ' . $att['national_id'] . ' ' . $att['student_id'] . ' ' . $att['room_number'] . ' ' . $att['floor'])) ?>">
+                                        <td class="p-3 text-center">
+                                            <?php if ($hasAttRecord): ?>
+                                                <input type="checkbox" class="att-row-check rounded border-slate-600 bg-slate-900 text-rose-500 cursor-pointer" value="<?= (int)$att['attendance_id'] ?>" onchange="updateAttSelectedCount()">
+                                            <?php else: ?>
+                                                <span class="text-slate-600 text-[10px]" title="ثبت مستقیم نشده">—</span>
+                                            <?php endif; ?>
+                                        </td>
                                         <td class="p-3 font-bold text-white"><?= htmlspecialchars($att['full_name']) ?></td>
                                         <td class="p-3 font-mono">
                                             <span class="text-indigo-400 font-bold block"><?= htmlspecialchars($att['student_id']) ?></span>
@@ -3049,12 +4502,22 @@ try {
                                             <span class="px-2.5 py-1 rounded-lg text-xs font-bold <?= $att['attendance_status'] === 'حاضر' ? 'bg-emerald-500/20 text-emerald-300' : ($att['attendance_status'] === 'غایب' ? 'bg-rose-500/20 text-rose-300' : 'bg-amber-500/20 text-amber-300') ?>">
                                                 <?= htmlspecialchars($att['attendance_status']) ?>
                                             </span>
+                                            <?php if (!$hasAttRecord): ?>
+                                                <span class="text-[10px] text-slate-500 block mt-0.5">پیش‌فرض (بدون ثبت)</span>
+                                            <?php endif; ?>
                                         </td>
-                                        <td class="p-3 text-[11px] text-slate-300"><?= htmlspecialchars($att['attendance_notes'] ?? 'ثبت حضوری انجام شد') ?></td>
+                                        <td class="p-3 text-[11px] text-slate-300"><?= htmlspecialchars($att['attendance_notes'] ?? ($hasAttRecord ? 'ثبت حضوری انجام شد' : 'رکورد مستقیمی برای این تاریخ ثبت نشده است')) ?></td>
                                         <td class="p-3 text-center">
-                                            <button type="button" onclick="openIndividualPrintModal('<?= htmlspecialchars($att['full_name']) ?>', '<?= htmlspecialchars($att['student_id']) ?>', '<?= htmlspecialchars($att['national_id']) ?>', '<?= htmlspecialchars($att['room_number']) ?>', '<?= htmlspecialchars($att['floor']) ?>', '<?= htmlspecialchars($att['attendance_status']) ?>', '<?= htmlspecialchars($att['attendance_notes'] ?? 'تایید حضور حضوری') ?>')" class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-indigo-300 hover:text-white rounded-lg text-xs font-bold border border-slate-700 transition-colors cursor-pointer">
-                                                پرینت فردی 🖨
-                                            </button>
+                                            <div class="inline-flex items-center gap-1.5 flex-wrap justify-center">
+                                                <button type="button" onclick="openIndividualPrintModal('<?= htmlspecialchars($att['full_name']) ?>', '<?= htmlspecialchars($att['student_id']) ?>', '<?= htmlspecialchars($att['national_id']) ?>', '<?= htmlspecialchars($att['room_number']) ?>', '<?= htmlspecialchars($att['floor']) ?>', '<?= htmlspecialchars($att['attendance_status']) ?>', '<?= htmlspecialchars($att['attendance_notes'] ?? 'تایید حضور حضوری') ?>')" class="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-indigo-300 hover:text-white rounded-lg text-xs font-bold border border-slate-700 transition-colors cursor-pointer">
+                                                    پرینت فردی 🖨
+                                                </button>
+                                                <?php if ($hasAttRecord): ?>
+                                                    <button type="button" onclick="deleteSingleAttendance(<?= (int)$att['attendance_id'] ?>, '<?= htmlspecialchars($att['full_name'], ENT_QUOTES) ?>')" class="px-2.5 py-1 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-lg text-xs font-bold transition-colors cursor-pointer">
+                                                        🗑 حذف
+                                                    </button>
+                                                <?php endif; ?>
+                                            </div>
                                         </td>
                                     </tr>
                                 <?php endforeach; ?>
@@ -3063,8 +4526,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 7: SUPERVISORS & MANAGERS ===================== -->
+            <?php if (in_array('supervisors', $allowedManagerTabs, true)): ?>
             <div id="tab-supervisors" class="tab-pane hidden space-y-6">
                 <!-- فرم ثبت کاربر جدید (سرپرست خوابگاه یا کاربر مدیر کل) -->
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
@@ -3091,11 +4556,11 @@ try {
                         <input type="hidden" name="admin_role" id="add_admin_role_input" value="supervisor">
                         <div>
                             <label class="block text-slate-300 font-semibold mb-1">کد ملی ده رقمی (نام کاربری) *</label>
-                            <input type="text" name="sup_national_id" id="add_sup_nid" maxlength="10" placeholder="مثال: 0099887766" required class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl font-mono focus:border-amber-500 outline-none" dir="ltr">
+                            <input type="text" name="sup_national_id" id="add_sup_nid" maxlength="10" placeholder="کد ملی ۱۰ رقمی" required class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl font-mono focus:border-amber-500 outline-none" dir="ltr">
                         </div>
                         <div>
                             <label id="add_sup_name_label" class="block text-slate-300 font-semibold mb-1">نام و نام خانوادگی سرپرست *</label>
-                            <input type="text" name="sup_full_name" id="add_sup_full_name" placeholder="مثال: مهندس حسام داوودی" required class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl focus:border-amber-500 outline-none">
+                            <input type="text" name="sup_full_name" id="add_sup_full_name" placeholder="نام و نام خانوادگی" required class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl focus:border-amber-500 outline-none">
                         </div>
                         <div>
                             <label id="add_sup_days_label" class="block text-slate-300 font-semibold mb-1">روزهای شیفت کاری *</label>
@@ -3117,8 +4582,42 @@ try {
                         </div>
                         <div>
                             <label class="block text-slate-300 font-semibold mb-1">کلمه عبور اختصاصی *</label>
-                            <input type="text" name="sup_password" id="add_sup_password" value="Super@12345" required class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl font-mono focus:border-amber-500 outline-none" dir="ltr">
+                            <input type="password" name="sup_password" id="add_sup_password" value="" placeholder="حداقل ۴ کاراکتر" required class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl font-mono focus:border-amber-500 outline-none" dir="ltr">
                         </div>
+                        <div id="mgr-permissions-box" class="hidden sm:col-span-2 lg:col-span-5 bg-slate-900/90 border border-indigo-500/30 rounded-2xl p-4 space-y-3">
+                            <input type="hidden" name="mgr_permissions_submitted" value="1">
+                            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+                                <div>
+                                    <h4 class="text-xs font-bold text-indigo-300 flex items-center gap-1.5">
+                                        <span>🔐</span>
+                                        <span>تعیین سیاست و محدوده دسترسی مدیر جدید</span>
+                                    </h4>
+                                    <p class="text-[11px] text-slate-400 mt-0.5">تنها قابلیت‌هایی که خودتان مجوز آن را دارید قابل انتخاب و تفویض است.</p>
+                                </div>
+                                <div class="flex items-center gap-2 text-[11px]">
+                                    <button type="button" onclick="toggleMgrCreatePerms(true)" class="px-2.5 py-1 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/40 rounded-lg font-bold transition-all cursor-pointer">انتخاب همه</button>
+                                    <button type="button" onclick="toggleMgrCreatePerms(false)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white border border-slate-700 rounded-lg font-bold transition-all cursor-pointer">حذف همه</button>
+                                </div>
+                            </div>
+                            <?php if (empty($grantableManagerCatalog)): ?>
+                                <div class="text-xs text-amber-300 bg-amber-950/40 border border-amber-500/30 rounded-xl p-3">
+                                    هیچ مجوز مدیریتی قابل تفویض در نشست فعلی شما وجود ندارد.
+                                </div>
+                            <?php else: ?>
+                                <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                                    <?php foreach ($grantableManagerCatalog as $permItem): ?>
+                                        <label class="flex items-start gap-2 p-2 rounded-xl bg-slate-950/70 border border-slate-800 hover:border-indigo-500/40 cursor-pointer transition-colors">
+                                            <input type="checkbox" name="mgr_permissions[]" value="<?= htmlspecialchars($permItem['permission_key']) ?>" checked class="mgr-create-perm-cb mt-0.5 rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500">
+                                            <div class="min-w-0">
+                                                <div class="text-[11px] font-bold text-slate-200 leading-snug"><?= htmlspecialchars($permItem['permission_label']) ?></div>
+                                                <div class="text-[10px] font-mono text-slate-500"><?= htmlspecialchars($permItem['permission_key']) ?></div>
+                                            </div>
+                                        </label>
+                                    <?php endforeach; ?>
+                                </div>
+                            <?php endif; ?>
+                        </div>
+
                         <div class="sm:col-span-2 lg:col-span-5 flex items-center justify-between pt-1 gap-3 flex-wrap">
                             <span id="add-admin-role-hint" class="text-[11px] text-amber-300/90">نقش انتخابی: سرپرست شیفت (دسترسی به پنل سرپرست خوابگاه)</span>
                             <button type="submit" id="add-admin-submit-btn" class="px-5 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-slate-950 font-bold rounded-xl text-xs shadow-md transition-all cursor-pointer">
@@ -3133,59 +4632,109 @@ try {
                     <div class="flex items-center justify-between">
                         <h4 class="text-xs font-bold text-indigo-300 flex items-center gap-2">
                             <span>👔</span>
-                            <span>کاربران مدیر کل سامانه (<?= count($managers) ?> کاربر)</span>
+                            <span>کاربران مدیر سامانه (<?= count($managers) ?> کاربر)</span>
                         </h4>
-                        <span class="text-[11px] text-slate-400">دارای دسترسی کامل به داشبورد مدیریت کل</span>
+                        <span class="text-[11px] text-slate-400">سیاست دسترسی تفکیکی و سلسله‌مراتب حذف امن</span>
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         <?php
-                            $currentAdminNid = $jwtAuth['sub'] ?? ($_SESSION['admin_national_id'] ?? '');
+                            $currentAdminNid = trim((string)($jwtAuth['sub'] ?? ($_SESSION['admin_national_id'] ?? '')));
+                            $myPermsList = is_array($jwtAuth['permissions'] ?? null) ? $jwtAuth['permissions'] : [];
                             foreach ($managers as $mgr):
+                                $mgrNid = trim((string)($mgr['national_id'] ?? ''));
                                 $mgrDays = !empty($mgr['shift_days']) ? $mgr['shift_days'] : 'شنبه تا پنج‌شنبه';
                                 $mgrHours = !empty($mgr['shift_hours']) ? $mgr['shift_hours'] : '۰۸:۰۰ الی ۱۶:۰۰ (اداری)';
-                                $isCurrentMgr = ($mgr['national_id'] === $currentAdminNid);
+                                $isCurrentMgr = ($mgrNid === $currentAdminNid);
+                                $isRootMgr = samad_is_root_manager($mgrNid);
+                                $creatorNid = trim((string)($mgr['created_by_national_id'] ?? ''));
+                                $isCreatedByMe = ($creatorNid !== '' && $creatorNid === $currentAdminNid);
+                                $canManageTargetMgr = !$isCurrentMgr && !$isRootMgr && (samad_is_root_manager($currentAdminNid) || $isCreatedByMe);
+                                $targetPerms = $managerPermissionsMap[$mgrNid] ?? [];
+                                $visibleGrantedPerms = array_values(array_intersect($targetPerms, $myPermsList));
                         ?>
-                            <div class="bg-[#1e293b]/70 border <?= $isCurrentMgr ? 'border-indigo-500/50' : 'border-slate-800' ?> rounded-2xl p-5 shadow-lg space-y-3 relative">
-                                <div class="flex justify-between items-center gap-2">
-                                    <div class="flex items-center gap-3 min-w-0">
-                                        <div class="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-300 font-bold text-sm shrink-0">
-                                            👔
+                            <div class="bg-[#1e293b]/70 border <?= $isCurrentMgr ? 'border-indigo-500/50' : 'border-slate-800' ?> rounded-2xl p-5 shadow-lg space-y-3 relative flex flex-col justify-between">
+                                <div class="space-y-3">
+                                    <div class="flex justify-between items-center gap-2">
+                                        <div class="flex items-center gap-3 min-w-0">
+                                            <div class="w-10 h-10 rounded-xl bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-indigo-300 font-bold text-sm shrink-0">
+                                                👔
+                                            </div>
+                                            <div class="min-w-0">
+                                                <h4 class="font-bold text-white text-sm truncate"><?= htmlspecialchars($mgr['full_name']) ?></h4>
+                                                <span class="text-[10px] text-slate-400 font-mono">کدملی: <?= htmlspecialchars($mgrNid) ?></span>
+                                            </div>
                                         </div>
-                                        <div class="min-w-0">
-                                            <h4 class="font-bold text-white text-sm truncate"><?= htmlspecialchars($mgr['full_name']) ?></h4>
-                                            <span class="text-[10px] text-slate-400 font-mono">کدملی: <?= htmlspecialchars($mgr['national_id']) ?></span>
+                                        <?php if ($isRootMgr): ?>
+                                            <span class="px-2 py-0.5 bg-amber-500/20 text-amber-300 border border-amber-500/30 rounded text-[10px] font-bold shrink-0">مدیر ارشد ★</span>
+                                        <?php elseif ($isCreatedByMe): ?>
+                                            <span class="px-2 py-0.5 bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 rounded text-[10px] font-bold shrink-0">ایجادشده توسط شما ✓</span>
+                                        <?php else: ?>
+                                            <span class="px-2 py-0.5 bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 rounded text-[10px] font-bold shrink-0">مدیر ✓</span>
+                                        <?php endif; ?>
+                                    </div>
+
+                                    <div class="p-3 bg-slate-900/80 rounded-xl space-y-2 text-xs">
+                                        <div class="flex items-center justify-between text-slate-300">
+                                            <span class="text-slate-400">📅 روزهای حضور:</span>
+                                            <span class="font-bold text-cyan-300"><?= htmlspecialchars($mgrDays) ?></span>
+                                        </div>
+                                        <div class="flex items-center justify-between text-slate-300">
+                                            <span class="text-slate-400">⏰ ساعات کاری:</span>
+                                            <span class="font-bold text-indigo-300"><?= htmlspecialchars($mgrHours) ?></span>
+                                        </div>
+                                        <?php if ($creatorNid !== ''): ?>
+                                            <div class="flex items-center justify-between text-slate-300">
+                                                <span class="text-slate-400">ایجادشده توسط:</span>
+                                                <span class="font-mono text-slate-300 text-[11px]"><?= htmlspecialchars($creatorNid) ?></span>
+                                            </div>
+                                        <?php endif; ?>
+                                        <div class="flex items-center justify-between text-slate-300">
+                                            <span class="text-slate-400">سطح دسترسی:</span>
+                                            <span class="text-emerald-300 font-bold font-mono text-[11px]"><?= count($visibleGrantedPerms) ?> قابلیت مجاز</span>
                                         </div>
                                     </div>
-                                    <span class="px-2 py-0.5 bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 rounded text-[10px] font-bold shrink-0">مدیر کل ✓</span>
+
+                                    <?php if (!empty($visibleGrantedPerms)): ?>
+                                        <div class="flex flex-wrap gap-1">
+                                            <?php foreach (array_slice($visibleGrantedPerms, 0, 4) as $vp): ?>
+                                                <span class="px-1.5 py-0.5 rounded bg-indigo-950/60 text-indigo-200 border border-indigo-500/30 text-[10px]">
+                                                    <?= htmlspecialchars($managerPermissionLabels[$vp] ?? $vp) ?>
+                                                </span>
+                                            <?php endforeach; ?>
+                                            <?php if (count($visibleGrantedPerms) > 4): ?>
+                                                <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px] font-mono">+<?= count($visibleGrantedPerms) - 4 ?> مورد دیگر</span>
+                                            <?php endif; ?>
+                                        </div>
+                                    <?php endif; ?>
                                 </div>
 
-                                <div class="p-3 bg-slate-900/80 rounded-xl space-y-2 text-xs">
-                                    <div class="flex items-center justify-between text-slate-300">
-                                        <span class="text-slate-400">📅 روزهای حضور:</span>
-                                        <span class="font-bold text-cyan-300"><?= htmlspecialchars($mgrDays) ?></span>
-                                    </div>
-                                    <div class="flex items-center justify-between text-slate-300">
-                                        <span class="text-slate-400">⏰ ساعات کاری:</span>
-                                        <span class="font-bold text-indigo-300"><?= htmlspecialchars($mgrHours) ?></span>
-                                    </div>
-                                    <div class="flex items-center justify-between text-slate-300">
-                                        <span class="text-slate-400">سطح دسترسی:</span>
-                                        <span class="text-emerald-300 font-bold">دسترسی کل مدیریت</span>
-                                    </div>
-                                </div>
-
-                                <div class="flex items-center justify-between pt-2 border-t border-slate-800 text-[11px]">
+                                <div class="flex items-center justify-between pt-2 border-t border-slate-800 text-[11px] gap-2 flex-wrap">
                                     <?php if ($isCurrentMgr): ?>
                                         <span class="text-emerald-400 font-bold">● حساب فعال جاری شما</span>
+                                    <?php elseif ($canManageTargetMgr): ?>
+                                        <div class="flex items-center gap-1.5 flex-wrap w-full justify-between">
+                                            <?php if (!empty($grantableManagerCatalog)): ?>
+                                                <button type="button"
+                                                    data-mgr-id="<?= intval($mgr['id']) ?>"
+                                                    data-mgr-name="<?= htmlspecialchars((string)$mgr['full_name'], ENT_QUOTES, 'UTF-8') ?>"
+                                                    data-mgr-nid="<?= htmlspecialchars($mgrNid, ENT_QUOTES, 'UTF-8') ?>"
+                                                    data-mgr-perms="<?= htmlspecialchars(json_encode($visibleGrantedPerms, JSON_UNESCAPED_UNICODE), ENT_QUOTES, 'UTF-8') ?>"
+                                                    onclick="openManagerPolicyModalFromBtn(this)"
+                                                    class="px-2.5 py-1 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-200 hover:text-white border border-indigo-500/40 rounded-lg text-[11px] font-bold transition-colors cursor-pointer">
+                                                    تغییر دسترسی‌ها (سیاست) ⚙️
+                                                </button>
+                                            <?php endif; ?>
+                                            <?php if (count($managers) > 1): ?>
+                                                <button type="button"
+                                                    data-mgr-id="<?= intval($mgr['id']) ?>"
+                                                    data-mgr-name="<?= htmlspecialchars((string)$mgr['full_name'], ENT_QUOTES, 'UTF-8') ?>"
+                                                    data-mgr-nid="<?= htmlspecialchars($mgrNid, ENT_QUOTES, 'UTF-8') ?>"
+                                                    onclick="openDeleteManagerSecretModalFromBtn(this)"
+                                                    class="px-2.5 py-1 bg-rose-950/70 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-lg text-[11px] font-bold transition-colors cursor-pointer" title="حذف کاربر مدیر">حذف مدیر ✕</button>
+                                            <?php endif; ?>
+                                        </div>
                                     <?php else: ?>
-                                        <span class="text-slate-400">ورود با کد ملی و رمز اختصاصی</span>
-                                        <?php if (count($managers) > 1): ?>
-                                            <form method="POST" onsubmit="return confirm('آیا از حذف دسترسی این کاربر مدیر کل اطمینان دارید؟');" class="inline">
-                                                <input type="hidden" name="action_delete_manager" value="1">
-                                                <input type="hidden" name="manager_id" value="<?= $mgr['id'] ?>">
-                                                <button type="submit" class="px-2.5 py-1 bg-rose-950/60 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-lg text-[11px] font-bold transition-colors cursor-pointer" title="حذف کاربر مدیر">حذف مدیر ✕</button>
-                                            </form>
-                                        <?php endif; ?>
+                                        <span class="text-slate-500">محافظت‌شده در سلسله‌مراتب مدیریتی</span>
                                     <?php endif; ?>
                                 </div>
                             </div>
@@ -3238,7 +4787,7 @@ try {
 
                                 <div class="flex items-center justify-between pt-2 border-t border-slate-800 gap-2">
                                     <div class="flex items-center gap-1.5">
-                                        <button type="button" onclick="openSupervisorCardModal('<?= htmlspecialchars($sup['full_name']) ?>', '<?= htmlspecialchars($sup['national_id']) ?>')" class="px-2.5 py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white rounded-xl text-xs font-bold transition-all border border-indigo-500/30 cursor-pointer">
+                                        <button type="button" onclick="openSupervisorCardModal('<?= htmlspecialchars((string)$sup['full_name'], ENT_QUOTES, 'UTF-8') ?>', '<?= htmlspecialchars((string)$sup['national_id'], ENT_QUOTES, 'UTF-8') ?>', '<?= htmlspecialchars((string)$supDays, ENT_QUOTES, 'UTF-8') ?>', '<?= htmlspecialchars((string)$supHours, ENT_QUOTES, 'UTF-8') ?>')" class="px-2.5 py-1.5 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white rounded-xl text-xs font-bold transition-all border border-indigo-500/30 cursor-pointer">
                                             کارت سرپرست 🪪
                                         </button>
                                         <button type="button" onclick="openEditSupervisorShiftModal(<?= $sup['id'] ?>, '<?= htmlspecialchars($sup['full_name']) ?>', '<?= htmlspecialchars($supDays) ?>', '<?= htmlspecialchars($supHours) ?>')" class="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 rounded-xl text-xs font-bold transition-all border border-slate-700 cursor-pointer" title="تنظیم روزهای شیفت و ساعات کاری">
@@ -3256,8 +4805,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 8: FESTIVALS & VOLUNTEERS ===================== -->
+            <?php if (in_array('festivals', $allowedManagerTabs, true)): ?>
             <div id="tab-festivals" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 border-b border-slate-800 pb-3">
@@ -3293,7 +4844,7 @@ try {
                                 <button type="button" onclick="filterCallsByStatus('all', this)" class="call-filter-btn px-2.5 py-1 rounded-lg font-bold bg-indigo-600 text-white cursor-pointer transition-all">همه</button>
                                 <button type="button" onclick="filterCallsByStatus('active', this)" class="call-filter-btn px-2.5 py-1 rounded-lg bg-emerald-950/60 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-900/60 cursor-pointer transition-all">🟢 فعال</button>
                                 <button type="button" onclick="filterCallsByStatus('upcoming', this)" class="call-filter-btn px-2.5 py-1 rounded-lg bg-amber-950/60 text-amber-300 border border-amber-500/40 hover:bg-amber-900/60 cursor-pointer transition-all">🟡 آینده (به‌زودی)</button>
-                                <button type="button" onclick="filterCallsByStatus('expired', this)" class="call-filter-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-400 border border-slate-700 hover:bg-slate-750 cursor-pointer transition-all">⚪ پایان‌یافته</button>
+                                <button type="button" onclick="filterCallsByStatus('expired', this)" class="call-filter-btn px-2.5 py-1 rounded-lg bg-slate-800 text-slate-400 border border-slate-700 hover:bg-slate-700 cursor-pointer transition-all">⚪ پایان‌یافته</button>
                             </div>
                         </div>
 
@@ -3448,8 +4999,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 9: SKILLS BANK & LIVE SEARCH ===================== -->
+            <?php if (in_array('skills', $allowedManagerTabs, true)): ?>
             <div id="tab-skills" class="tab-pane hidden space-y-6">
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-4">
                     <div class="border-b border-slate-800 pb-3 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3">
@@ -3536,8 +5089,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 10: WELFARE & GYM RESERVATIONS ===================== -->
+            <?php if (in_array('welfare', $allowedManagerTabs, true)): ?>
             <div id="tab-welfare" class="tab-pane hidden space-y-6">
                 <!-- سربرگ و آمار کلی سالن بدنسازی و خدمات رفاهی -->
                 <div class="bg-[#1e293b]/70 border border-slate-800 rounded-2xl p-6 shadow-xl space-y-5">
@@ -4147,8 +5702,10 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
 
             <!-- ===================== TAB 11: JWT AUTHORIZATION & RBAC ===================== -->
+            <?php if (in_array('authjwt', $allowedManagerTabs, true)): ?>
             <div id="tab-authjwt" class="tab-pane hidden space-y-6">
                 <!-- ردیف شاخص‌های کلیدی دسترسی (Tabular Numerals) -->
                 <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -4215,10 +5772,13 @@ try {
                 <div class="bg-[#0f172a] border border-slate-800 rounded-2xl p-5 space-y-4">
                     <div class="flex flex-col md:flex-row md:items-center justify-between gap-3 border-b border-slate-800 pb-4">
                         <div>
-                            <h3 class="text-sm font-bold text-white">فهرست توکن‌های JWT صادرشده و کنترل نشست‌ها</h3>
-                            <p class="text-[11px] text-slate-400 mt-0.5">با ابطال هر توکن، دسترسی کاربر در صفحات PHP و گراف تعاملی خوابگاه بلافاصله قطع می‌شود.</p>
+                            <h3 class="text-sm font-bold text-white">فهرست توکن‌های JWT صادرشده و کنترل نشست‌ها (نمایش ۱۵ توکن اخیر)</h3>
+                            <p class="text-[11px] text-slate-400 mt-0.5">جدول جهت جلوگیری از شلوغی، ۱۵ نشست اخیر را نمایش می‌دهد. برای آرشیو کامل لاگ توکن‌ها از دکمه‌های اکسل استفاده کنید.</p>
                         </div>
                         <div class="flex items-center gap-2 flex-wrap">
+                            <a href="export_excel.php?type=jwt_tokens&range=1m" class="px-2.5 py-1.5 bg-teal-600/20 hover:bg-teal-600 text-teal-300 hover:text-white border border-teal-500/35 rounded-xl text-[11px] font-bold transition-colors">📊 اکسل ۱ ماهه</a>
+                            <a href="export_excel.php?type=jwt_tokens&range=3m" class="px-2.5 py-1.5 bg-teal-600/20 hover:bg-teal-600 text-teal-300 hover:text-white border border-teal-500/35 rounded-xl text-[11px] font-bold transition-colors">📊 اکسل ۳ ماهه</a>
+                            <a href="export_excel.php?type=jwt_tokens&range=6m" class="px-2.5 py-1.5 bg-teal-600/20 hover:bg-teal-600 text-teal-300 hover:text-white border border-teal-500/35 rounded-xl text-[11px] font-bold transition-colors">📊 اکسل ۶ ماهه</a>
                             <input type="text" id="jwtSearchInput" oninput="filterJwtTable()" placeholder="جستجوی نام، شناسه یا JTI..." class="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white focus:ring-2 focus:ring-indigo-500">
                             <select id="jwtRoleFilter" onchange="filterJwtTable()" class="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white">
                                 <option value="all">همه نقش‌ها</option>
@@ -4371,7 +5931,7 @@ try {
                                             </div>
                                         <?php else: ?>
                                             <?php foreach ($rPerms as $rp):
-                                                $isLocked = ($rKey === 'manager' && in_array($rp['permission_key'], ['auth:tokens:manage', 'dorm:rooms:manage'], true));
+                                                $isLocked = ($rKey === 'manager' && $rp['permission_key'] === 'auth:tokens:manage');
                                             ?>
                                                 <label class="flex items-start gap-2.5 text-xs cursor-pointer p-1.5 rounded-lg hover:bg-slate-900">
                                                     <input
@@ -4399,6 +5959,266 @@ try {
                                 </button>
                             </form>
                         <?php endforeach; ?>
+                    </div>
+                </div>
+
+                <!-- تنظیم محدودیت و سهمیه زمانی اکشن‌های دانشجو (Rate Limits) -->
+                <?php
+                $enabledLimitsCount = 0;
+                $totalBlockedCount = array_sum($studentActionBlockStats);
+                $limitCategories = [];
+                foreach ($studentActionLimits as $cfgItem) {
+                    if (!empty($cfgItem['is_limit_enabled'])) {
+                        $enabledLimitsCount++;
+                    }
+                    $limitCategories[$cfgItem['category']] = true;
+                }
+                ?>
+                <div class="bg-[#0f172a] border border-slate-800 rounded-2xl p-5 space-y-4">
+                    <div class="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-3 border-b border-slate-800 pb-4">
+                        <div>
+                            <div class="flex flex-wrap items-center gap-2">
+                                <h3 class="text-sm font-bold text-white">مدیریت محدودیت و سهمیه زمانی اکشن‌های دانشجو (Rate Limits)</h3>
+                                <span class="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30 text-[11px] font-bold tabular-nums">
+                                    <?= count($studentActionLimits) ?> اکشن ثبت‌شده (<?= $enabledLimitsCount ?> محدودیت فعال)
+                                </span>
+                                <?php if ($totalBlockedCount > 0): ?>
+                                    <span class="px-2 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 text-[11px] font-bold tabular-nums">
+                                        <?= $totalBlockedCount ?> تلاش مسدودشده (۳۰ روز اخیر)
+                                    </span>
+                                <?php endif; ?>
+                            </div>
+                            <p class="text-[11px] text-slate-400 mt-1">
+                                برای هر عملیات دانشجو می‌توانید حداکثر دفعات مجاز انجام کار (تعداد مجاز) و پنجره زمانی لغزنده (بر حسب روز) را به‌صورت دستی تنظیم یا محدودیت آن را غیرفعال کنید. (عدد ۰ برای تعداد مجاز به معنای مسدودسازی موقت آن اکشن است.)
+                            </p>
+                        </div>
+                        <div class="flex flex-wrap items-center gap-2">
+                            <input type="text" id="studentLimitSearchInput" oninput="filterStudentLimitsTable()" placeholder="جستجوی اکشن، کلید یا مجوز..." class="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white focus:ring-2 focus:ring-indigo-500">
+                            <select id="studentLimitCategoryFilter" onchange="filterStudentLimitsTable()" class="px-3 py-1.5 bg-slate-950 border border-slate-700 rounded-xl text-xs text-white">
+                                <option value="all">همه دسته‌ها</option>
+                                <?php foreach (array_keys($limitCategories) as $catName): ?>
+                                    <option value="<?= htmlspecialchars($catName) ?>"><?= htmlspecialchars($catName) ?></option>
+                                <?php endforeach; ?>
+                            </select>
+                        </div>
+                    </div>
+
+                    <form method="POST" action="?tab=authjwt" class="space-y-4">
+                        <input type="hidden" name="action_save_student_limits" value="1">
+                        <div class="overflow-x-auto rounded-xl border border-slate-800/80">
+                            <table id="studentLimitsTable" class="w-full text-right text-xs border-collapse">
+                                <thead>
+                                    <tr class="bg-slate-950/80 text-slate-400 border-b border-slate-800">
+                                        <th class="p-2.5 font-bold min-w-[230px]">اکشن دانشجو / کلید فنی</th>
+                                        <th class="p-2.5 font-bold whitespace-nowrap">وضعیت محدودیت</th>
+                                        <th class="p-2.5 font-bold whitespace-nowrap">تعداد مجاز (بار)</th>
+                                        <th class="p-2.5 font-bold whitespace-nowrap">بازه زمانی (روز)</th>
+                                        <th class="p-2.5 font-bold whitespace-nowrap">مصرف در پنجره فعلی</th>
+                                    </tr>
+                                </thead>
+                                <tbody class="divide-y divide-slate-800/80">
+                                    <?php $limitIdx = 0; foreach ($studentActionLimits as $aKey => $cfg):
+                                        $limitIdx++;
+                                        $rbacOk = $studentRbacStatusMap[$cfg['permission_key']] ?? true;
+                                        $uStat = $studentActionUsageStats[$aKey] ?? ['hits' => 0, 'students' => 0];
+                                        $bCount = $studentActionBlockStats[$aKey] ?? 0;
+                                        $searchBlob = mb_strtolower($cfg['action_label'] . ' ' . $aKey . ' ' . $cfg['permission_key'] . ' ' . $cfg['category'], 'UTF-8');
+                                    ?>
+                                        <tr class="student-limit-row hover:bg-slate-900/50 transition-colors"
+                                            data-category="<?= htmlspecialchars($cfg['category']) ?>"
+                                            data-search="<?= htmlspecialchars($searchBlob) ?>">
+                                            <td class="p-2.5 align-top">
+                                                <div class="font-bold text-white leading-snug"><?= htmlspecialchars($cfg['action_label']) ?></div>
+                                                <div class="flex flex-wrap items-center gap-1.5 mt-1">
+                                                    <span class="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px]"><?= htmlspecialchars($cfg['category']) ?></span>
+                                                    <span class="text-[10px] font-mono text-indigo-300"><?= htmlspecialchars($aKey) ?></span>
+                                                    <span class="text-[10px] font-mono <?= $rbacOk ? 'text-emerald-400' : 'text-rose-400' ?>">
+                                                        [<?= htmlspecialchars($cfg['permission_key']) ?>: <?= $rbacOk ? 'مجاز در RBAC' : 'بسته در RBAC' ?>]
+                                                    </span>
+                                                </div>
+                                            </td>
+                                            <td class="p-2.5 align-middle whitespace-nowrap">
+                                                <label class="inline-flex items-center gap-2 cursor-pointer px-2.5 py-1.5 rounded-lg bg-slate-950 border border-slate-800 hover:border-slate-700">
+                                                    <input type="checkbox"
+                                                           name="limits[<?= htmlspecialchars($aKey) ?>][enabled]"
+                                                           value="1"
+                                                           <?= $cfg['is_limit_enabled'] ? 'checked' : '' ?>
+                                                           onchange="syncStudentLimitBadge(this)"
+                                                           class="rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500">
+                                                    <span class="limit-status-label text-[11px] font-bold <?= $cfg['is_limit_enabled'] ? 'text-amber-300' : 'text-slate-400' ?>">
+                                                        <?= $cfg['is_limit_enabled'] ? 'محدودیت فعال' : 'نامحدود' ?>
+                                                    </span>
+                                                </label>
+                                            </td>
+                                            <td class="p-2.5 align-middle whitespace-nowrap">
+                                                <div class="flex items-center gap-1.5">
+                                                    <input type="number"
+                                                           name="limits[<?= htmlspecialchars($aKey) ?>][max_count]"
+                                                           min="0"
+                                                           max="100000"
+                                                           value="<?= (int)$cfg['max_count'] ?>"
+                                                           class="w-20 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white font-mono tabular-nums focus:ring-2 focus:ring-indigo-500">
+                                                    <span class="text-[11px] text-slate-400">بار</span>
+                                                </div>
+                                            </td>
+                                            <td class="p-2.5 align-middle whitespace-nowrap">
+                                                <div class="flex items-center gap-1.5">
+                                                    <input type="number"
+                                                           id="limitWinDays_<?= $limitIdx ?>"
+                                                           name="limits[<?= htmlspecialchars($aKey) ?>][window_days]"
+                                                           min="1"
+                                                           max="3650"
+                                                           value="<?= (int)$cfg['window_days'] ?>"
+                                                           class="w-16 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-xs text-white font-mono tabular-nums focus:ring-2 focus:ring-indigo-500">
+                                                    <span class="text-[11px] text-slate-400">روز</span>
+                                                    <div class="flex items-center gap-1 mr-1">
+                                                        <?php foreach ([1, 7, 30, 90] as $presetDay): ?>
+                                                            <button type="button"
+                                                                    onclick="setActionWindowDays('limitWinDays_<?= $limitIdx ?>', <?= $presetDay ?>)"
+                                                                    class="px-1.5 py-0.5 rounded bg-slate-800 hover:bg-indigo-600/40 text-slate-300 hover:text-white border border-slate-700 text-[10px] font-mono tabular-nums cursor-pointer transition-colors">
+                                                                <?= $presetDay ?>
+                                                            </button>
+                                                        <?php endforeach; ?>
+                                                    </div>
+                                                </div>
+                                            </td>
+                                            <td class="p-2.5 align-middle whitespace-nowrap">
+                                                <div class="flex flex-wrap items-center gap-1.5 text-[11px] tabular-nums">
+                                                    <span class="px-2 py-0.5 rounded bg-slate-800/90 text-slate-200 border border-slate-700">
+                                                        <?= (int)$uStat['hits'] ?> اجرا (<?= (int)$uStat['students'] ?> دانشجو)
+                                                    </span>
+                                                    <?php if ($bCount > 0): ?>
+                                                        <span class="px-2 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30 font-bold">
+                                                            <?= (int)$bCount ?> مسدودی ۴۲۹
+                                                        </span>
+                                                    <?php endif; ?>
+                                                </div>
+                                            </td>
+                                        </tr>
+                                    <?php endforeach; ?>
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pt-2 border-t border-slate-800">
+                            <p class="text-[11px] text-slate-400">
+                                تغییر سقف‌ها بلافاصله روی تمامی درخواست‌های دانشجو (میزکار، گراف خوابگاه، گراف مهارت‌ها و تمدید JWT) اعمال می‌شود.
+                            </p>
+                            <button type="submit" class="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl cursor-pointer transition-colors whitespace-nowrap shrink-0 shadow-lg shadow-indigo-950/40">
+                                ذخیره همه محدودیت‌های اکشن دانشجو
+                            </button>
+                        </div>
+                    </form>
+
+                    <!-- فرم بازنشانی مصرف سهمیه برای دانشجو -->
+                    <div class="bg-slate-950/70 border border-slate-800 rounded-xl p-4 space-y-4">
+                        <form method="POST" action="?tab=authjwt" class="grid grid-cols-1 lg:grid-cols-12 gap-3 items-end">
+                            <input type="hidden" name="action_reset_student_action_usage" value="1">
+                            <div class="lg:col-span-5 min-w-0">
+                                <label class="block text-[11px] font-bold text-slate-300 mb-1.5">بازنشانی (ریست) سهمیه مصرف‌شده برای دانشجوی مشخص</label>
+                                <input type="text"
+                                       id="resetStudentIdInput"
+                                       name="target_student_id"
+                                       list="rateLimitStudentDatalist"
+                                       required
+                                       placeholder="شماره دانشجویی یا کد ملی را انتخاب یا وارد کنید..."
+                                       class="w-full h-10 px-3 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white font-mono focus:ring-2 focus:ring-amber-500">
+                                <datalist id="rateLimitStudentDatalist">
+                                    <?php foreach ($rateLimitStudentsList as $stOpt): ?>
+                                        <option value="<?= htmlspecialchars($stOpt['student_id']) ?>"><?= htmlspecialchars($stOpt['full_name'] . ' — کدملی: ' . $stOpt['national_id']) ?></option>
+                                    <?php endforeach; ?>
+                                </datalist>
+                            </div>
+                            <div class="lg:col-span-5 min-w-0">
+                                <label class="block text-[11px] font-bold text-slate-300 mb-1.5">اکشن هدف</label>
+                                <select name="target_action_key" class="w-full h-10 px-3 bg-slate-900 border border-slate-700 rounded-xl text-xs text-white focus:ring-2 focus:ring-amber-500">
+                                    <option value="all">همه اکشن‌های دانشجو (ریست کامل)</option>
+                                    <?php foreach ($studentActionLimits as $aKey => $cfg): ?>
+                                        <option value="<?= htmlspecialchars($aKey) ?>"><?= htmlspecialchars($cfg['action_label']) ?> (<?= htmlspecialchars($aKey) ?>)</option>
+                                    <?php endforeach; ?>
+                                </select>
+                            </div>
+                            <div class="lg:col-span-2">
+                                <button type="submit" class="w-full h-10 px-4 bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold rounded-xl cursor-pointer transition-colors whitespace-nowrap">
+                                    بازنشانی مصرف دانشجو
+                                </button>
+                            </div>
+                        </form>
+
+                        <div class="border-t border-slate-800/80 pt-3 space-y-2.5">
+                            <div class="flex flex-wrap items-center justify-between gap-2">
+                                <div class="flex items-center gap-2">
+                                    <span class="text-[11px] font-bold text-slate-300">دانشجویان دارای مصرف فعال در پنجره زمانی:</span>
+                                    <span class="px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 text-[10px] font-mono tabular-nums">
+                                        <?= count($studentActiveUsageByStudent) ?> دانشجو
+                                    </span>
+                                </div>
+                                <?php if (!empty($studentActiveUsageByStudent)): ?>
+                                    <form method="POST" action="?tab=authjwt" onsubmit="return confirm('آیا از پاکسازی کامل مصرف سهمیه تمامی دانشجویان اطمینان دارید؟');">
+                                        <input type="hidden" name="action_reset_all_students_usage" value="1">
+                                        <button type="submit" class="px-3 py-1 bg-rose-600/20 hover:bg-rose-600 text-rose-300 hover:text-white border border-rose-500/30 rounded-lg text-[11px] font-bold cursor-pointer transition-colors whitespace-nowrap shrink-0">
+                                            پاکسازی مصرف همه دانشجویان
+                                        </button>
+                                    </form>
+                                <?php endif; ?>
+                            </div>
+
+                            <?php if (empty($studentActiveUsageByStudent)): ?>
+                                <p class="text-[11px] text-slate-500">در حال حاضر هیچ مصرف فعالی برای دانشجویان در پنجره زمانی ثبت نشده است.</p>
+                            <?php else: ?>
+                                <div class="overflow-x-auto rounded-xl border border-slate-800/70">
+                                    <table class="w-full text-right text-[11px] border-collapse">
+                                        <thead>
+                                            <tr class="bg-slate-900/80 text-slate-400 border-b border-slate-800">
+                                                <th class="p-2.5 font-bold whitespace-nowrap">دانشجو</th>
+                                                <th class="p-2.5 font-bold whitespace-nowrap">شماره دانشجویی / کد ملی</th>
+                                                <th class="p-2.5 font-bold">اکشن‌های مصرف‌شده (کلیک روی ریست هر مورد)</th>
+                                                <th class="p-2.5 font-bold whitespace-nowrap">بازنشانی کامل</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody class="divide-y divide-slate-800/70">
+                                            <?php foreach ($studentActiveUsageByStudent as $stuUsage): ?>
+                                                <tr class="hover:bg-slate-900/40 transition-colors">
+                                                    <td class="p-2.5 align-top font-bold text-white whitespace-nowrap"><?= htmlspecialchars($stuUsage['full_name']) ?></td>
+                                                    <td class="p-2.5 align-top font-mono tabular-nums text-slate-300 whitespace-nowrap">
+                                                        <span><?= htmlspecialchars($stuUsage['student_id']) ?></span>
+                                                        <span class="text-slate-500 mr-1">/ <?= htmlspecialchars($stuUsage['national_id']) ?></span>
+                                                    </td>
+                                                    <td class="p-2.5 align-top">
+                                                        <div class="flex flex-wrap items-center gap-1.5">
+                                                            <?php foreach ($stuUsage['actions'] as $actItem):
+                                                                $atLimit = $actItem['is_limit_enabled'] && ($actItem['hits'] >= $actItem['max_count']);
+                                                            ?>
+                                                                <form method="POST" action="?tab=authjwt" class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border <?= $atLimit ? 'bg-rose-500/15 border-rose-500/30 text-rose-200' : 'bg-slate-800/80 border-slate-700 text-slate-200' ?>">
+                                                                    <input type="hidden" name="action_reset_student_action_usage" value="1">
+                                                                    <input type="hidden" name="target_student_id" value="<?= htmlspecialchars($stuUsage['student_id']) ?>">
+                                                                    <input type="hidden" name="target_action_key" value="<?= htmlspecialchars($actItem['action_key']) ?>">
+                                                                    <span><?= htmlspecialchars($actItem['action_label']) ?>:</span>
+                                                                    <span class="font-mono tabular-nums font-bold"><?= (int)$actItem['hits'] ?><?= $actItem['is_limit_enabled'] ? '/' . (int)$actItem['max_count'] : '' ?></span>
+                                                                    <button type="submit" title="بازنشانی فقط همین اکشن" class="mr-0.5 px-1.5 py-0.5 rounded bg-slate-950/60 hover:bg-amber-600 text-amber-300 hover:text-white cursor-pointer transition-colors font-bold text-[10px]">
+                                                                        ریست
+                                                                    </button>
+                                                                </form>
+                                                            <?php endforeach; ?>
+                                                        </div>
+                                                    </td>
+                                                    <td class="p-2.5 align-top whitespace-nowrap">
+                                                        <form method="POST" action="?tab=authjwt" class="inline">
+                                                            <input type="hidden" name="action_reset_student_action_usage" value="1">
+                                                            <input type="hidden" name="target_student_id" value="<?= htmlspecialchars($stuUsage['student_id']) ?>">
+                                                            <input type="hidden" name="target_action_key" value="all">
+                                                            <button type="submit" class="px-2.5 py-1 bg-amber-600/20 hover:bg-amber-600 text-amber-300 hover:text-white border border-amber-500/30 rounded-lg text-[10px] font-bold cursor-pointer transition-colors whitespace-nowrap shrink-0">
+                                                                ریست کل (<?= (int)$stuUsage['total_hits'] ?>)
+                                                            </button>
+                                                        </form>
+                                                    </td>
+                                                </tr>
+                                            <?php endforeach; ?>
+                                        </tbody>
+                                    </table>
+                                </div>
+                            <?php endif; ?>
+                        </div>
                     </div>
                 </div>
 
@@ -4451,6 +6271,7 @@ try {
                     </div>
                 </div>
             </div>
+            <?php endif; ?>
         </div>
     </main>
 
@@ -4711,6 +6532,11 @@ try {
                         </div>
                     </div>
 
+                    <?php
+                        list($defJy, $defJm, $defJd) = gregorian_to_jalali(intval(date('Y')), intval(date('n')), intval(date('j')));
+                        $defJStr = sprintf('%04d/%02d/%02d', $defJy, $defJm, $defJd);
+                        $defJEndStr = add_days_to_jalali_php($defJStr, 7);
+                    ?>
                     <!-- ۲. تعیین تاریخ شروع میهمانی با ۳ سلکت آپشن (روز، ماه، سال) -->
                     <div>
                         <label class="block text-amber-200 font-bold mb-1.5 flex items-center gap-1.5 text-xs">
@@ -4723,7 +6549,7 @@ try {
                                 <label class="block text-[10px] text-amber-300/80 mb-1">روز:</label>
                                 <select id="guest_start_day" name="guest_start_day" onchange="updateGuestEndDatePreview()" class="w-full px-2.5 py-2 bg-slate-900 border border-amber-500/50 text-white rounded-xl text-xs font-mono font-bold focus:border-amber-400 outline-none cursor-pointer">
                                     <?php for ($d = 1; $d <= 31; $d++): ?>
-                                        <option value="<?= sprintf('%02d', $d) ?>" <?= $d === 25 ? 'selected' : '' ?>><?= $d ?></option>
+                                        <option value="<?= sprintf('%02d', $d) ?>" <?= $d === $defJd ? 'selected' : '' ?>><?= $d ?></option>
                                     <?php endfor; ?>
                                 </select>
                             </div>
@@ -4731,19 +6557,18 @@ try {
                             <!-- سلکت ماه -->
                             <div>
                                 <label class="block text-[10px] text-amber-300/80 mb-1">ماه:</label>
-                                <select id="guest_start_month" name="guest_start_month" onchange="updateGuestEndDatePreview()" class="w-full px-2 py-2 bg-slate-900 border border-amber-500/50 text-white rounded-xl text-xs font-bold focus:border-amber-400 outline-none cursor-pointer">
-                                    <option value="01">فروردین (۰۱)</option>
-                                    <option value="02">اردیبهشت (۰۲)</option>
-                                    <option value="03">خرداد (۰۳)</option>
-                                    <option value="04">تیر (۰۴)</option>
-                                    <option value="05">مرداد (۰۵)</option>
-                                    <option value="06">شهریور (۰۶)</option>
-                                    <option value="07" selected>مهر (۰۷)</option>
-                                    <option value="08">آبان (۰۸)</option>
-                                    <option value="09">آذر (۰۹)</option>
-                                    <option value="10">دی (۱۰)</option>
-                                    <option value="11">بهمن (۱۱)</option>
-                                    <option value="12">اسفند (۱۲)</option>
+                                <select id="guest_start_month" name="guest_start_month" onchange="updateGuestEndDatePreview()" class="w-full px-2.5 py-2 bg-slate-900 border border-amber-500/50 text-white rounded-xl text-xs font-bold focus:border-amber-400 outline-none cursor-pointer">
+                                    <?php
+                                        $jMonthsList = [
+                                            1 => 'فروردین (۰۱)', 2 => 'اردیبهشت (۰۲)', 3 => 'خرداد (۰۳)',
+                                            4 => 'تیر (۰۴)', 5 => 'مرداد (۰۵)', 6 => 'شهریور (۰۶)',
+                                            7 => 'مهر (۰۷)', 8 => 'آبان (۰۸)', 9 => 'آذر (۰۹)',
+                                            10 => 'دی (۱۰)', 11 => 'بهمن (۱۱)', 12 => 'اسفند (۱۲)'
+                                        ];
+                                        foreach ($jMonthsList as $mIdx => $mLbl):
+                                    ?>
+                                        <option value="<?= sprintf('%02d', $mIdx) ?>" <?= $mIdx === $defJm ? 'selected' : '' ?>><?= $mLbl ?></option>
+                                    <?php endforeach; ?>
                                 </select>
                             </div>
 
@@ -4751,19 +6576,15 @@ try {
                             <div>
                                 <label class="block text-[10px] text-amber-300/80 mb-1">سال:</label>
                                 <select id="guest_start_year" name="guest_start_year" onchange="updateGuestEndDatePreview()" class="w-full px-2.5 py-2 bg-slate-900 border border-amber-500/50 text-white rounded-xl text-xs font-mono font-bold focus:border-amber-400 outline-none cursor-pointer">
-                                    <option value="1402">۱۴۰۲</option>
-                                    <option value="1403">۱۴۰۳</option>
-                                    <option value="1404">۱۴۰۴</option>
-                                    <option value="1405" selected>۱۴۰۵</option>
-                                    <option value="1406">۱۴۰۶</option>
-                                    <option value="1407">۱۴۰۷</option>
-                                    <option value="1408">۱۴۰۸</option>
+                                    <?php for ($yOpt = max(1402, $defJy - 2); $yOpt <= max(1408, $defJy + 3); $yOpt++): ?>
+                                        <option value="<?= $yOpt ?>" <?= $yOpt === $defJy ? 'selected' : '' ?>><?= toPersianDigits((string)$yOpt) ?></option>
+                                    <?php endfor; ?>
                                 </select>
                             </div>
                         </div>
 
                         <!-- فیلد مخفی همگام‌ساز تاریخ شروع -->
-                        <input type="hidden" name="guest_start_date" id="guest_start_date_inp" value="1405/07/25">
+                        <input type="hidden" name="guest_start_date" id="guest_start_date_inp" value="<?= $defJStr ?>">
                         <span class="text-[10px] text-amber-300/80 block mt-1">مدیر تعداد روزها را تعیین کرده و با ۳ سلکت فوق تاریخ شروع را مشخص می‌نماید.</span>
                     </div>
 
@@ -4771,7 +6592,7 @@ try {
                     <div id="guest-end-date-preview" class="p-3 bg-amber-900/30 rounded-xl border border-amber-500/40 text-xs text-amber-200 space-y-1.5 shadow-inner">
                         <div class="flex items-center justify-between border-b border-amber-500/20 pb-1.5">
                             <span class="text-slate-300">📅 شروع میهمانی:</span>
-                            <span id="preview-guest-start-date" class="font-mono font-bold text-amber-300">۱۴۰۵/۰۷/۲۵</span>
+                            <span id="preview-guest-start-date" class="font-mono font-bold text-amber-300"><?= toPersianDigits($defJStr) ?></span>
                         </div>
                         <div class="flex items-center justify-between border-b border-amber-500/20 pb-1.5">
                             <span class="text-slate-300">⏱ مدت زمان اقامت:</span>
@@ -4779,7 +6600,7 @@ try {
                         </div>
                         <div class="flex items-center justify-between pt-0.5">
                             <span class="font-bold text-amber-200">🏁 تاریخ پایان و سررسید:</span>
-                            <strong id="preview-guest-end-date" class="font-mono font-bold text-emerald-300 text-sm">۱۴۰۵/۰۸/۰۲</strong>
+                            <strong id="preview-guest-end-date" class="font-mono font-bold text-emerald-300 text-sm"><?= toPersianDigits($defJEndStr) ?></strong>
                         </div>
                         <p class="text-[10px] text-amber-300/70 pt-1 leading-relaxed">
                             ℹ️ پس از سررسید این تاریخ، وضعیت اسکان منقضی شده و دانشجو به صورت خودکار به لیست متقاضیان خوابگاه بازمی‌گردد.
@@ -4909,11 +6730,11 @@ try {
                 <div class="pt-6 grid grid-cols-2 gap-8 text-center text-xs">
                     <div class="space-y-12">
                         <span class="font-bold block">مهر و امضای سرپرست شیفت شب:</span>
-                        <span class="text-slate-500 block">مهندس کامران قنبری</span>
+                        <span class="text-slate-500 block">سرپرست شیفت شب خوابگاه</span>
                     </div>
                     <div class="space-y-12">
                         <span class="font-bold block">تایید و امضای مدیر امور خوابگاه‌ها:</span>
-                        <span class="text-slate-500 block">دکتر علیرضا حسینی</span>
+                        <span class="text-slate-500 block">مدیر امور دانشجویی و خوابگاه‌ها</span>
                     </div>
                 </div>
             </div>
@@ -4972,7 +6793,7 @@ try {
                     </div>
                     <div class="space-y-8">
                         <span class="block font-bold">مدیر امور دانشجویی دانشگاه:</span>
-                        <span class="block text-slate-500">دکتر علیرضا حسینی</span>
+                        <span class="block text-slate-500">مدیر امور دانشجویی و خوابگاه‌ها</span>
                     </div>
                 </div>
             </div>
@@ -4980,8 +6801,8 @@ try {
     </div>
 
     <!-- ===================== MODAL: SUPERVISOR ID CARD ===================== -->
-    <div id="supervisorCardModal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4">
-        <div class="bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 text-white rounded-3xl p-6 sm:p-7 shadow-2xl border border-indigo-500/40 max-w-xl w-full relative">
+    <div id="supervisorCardModal" onclick="if(event.target === this) closeSupervisorCardModal()" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-xs p-4 overflow-y-auto">
+        <div class="bg-gradient-to-br from-slate-900 via-indigo-950 to-slate-900 text-white rounded-3xl p-6 sm:p-7 shadow-2xl border border-indigo-500/40 max-w-xl w-full relative my-8">
             <div class="flex items-center justify-between pb-4 border-b border-indigo-700/60">
                 <div class="flex items-center gap-3">
                     <div class="w-11 h-11 rounded-2xl bg-indigo-600 flex items-center justify-center font-bold text-white shadow-md">صمد</div>
@@ -5013,20 +6834,20 @@ try {
                             <span id="sup-card-nid" class="font-mono text-sm font-bold text-amber-300 tracking-wider"></span>
                         </div>
                         <div>
-                            <span class="text-indigo-300 text-[11px] block">شیفت کاری:</span>
-                            <span class="font-mono text-xs font-semibold text-slate-200">۲۲:۰۰ الی ۰۶:۰۰ (شبانه)</span>
+                            <span class="text-indigo-300 text-[11px] block">ساعات کاری شیفت:</span>
+                            <span id="sup-card-shift-hours" class="font-mono text-xs font-semibold text-slate-200">۲۲:۰۰ الی ۰۶:۰۰ (شبانه)</span>
                         </div>
                     </div>
 
                     <div class="p-3 bg-indigo-900/60 border border-indigo-600/50 rounded-xl space-y-1">
-                        <div class="text-amber-300 font-bold text-xs">مسئولیت: سرپرست شیفت شب - طبقات همکف، ۱ و ۲</div>
+                        <div class="text-amber-300 font-bold text-xs">روزهای کشیک: <span id="sup-card-shift-days" class="text-white">شنبه تا چهارشنبه</span></div>
                         <div class="text-slate-300 text-[10px]">🏢 ساختمان مرکزی خوابگاه صمد (پردیس فناوری و مهارت)</div>
                     </div>
                 </div>
             </div>
 
-            <div class="mt-5 pt-3 border-t border-indigo-800/60 flex items-center justify-between text-xs">
-                <span class="text-slate-400 text-[11px]">شناسه سرپرستی: <strong class="text-amber-300 font-mono">SUP-405-OFFICIAL</strong></span>
+            <div class="mt-5 pt-3 border-t border-indigo-800/60 flex items-center justify-between text-xs no-print">
+                <span class="text-slate-400 text-[11px]">شناسه سرپرستی: <strong id="sup-card-id-code" class="text-amber-300 font-mono">SUP-405-OFFICIAL</strong></span>
                 <div class="flex gap-2">
                     <button type="button" onclick="window.print()" class="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-colors cursor-pointer">
                         چاپ کارت 🖨
@@ -5036,6 +6857,23 @@ try {
                     </button>
                 </div>
             </div>
+
+            <?php if ($canImpersonateSupervisor): ?>
+            <form method="POST" class="no-print mt-4 flex items-center justify-between gap-3 p-3 bg-indigo-950/60 border border-indigo-500/35 rounded-2xl">
+                <input type="hidden" name="action_impersonate_supervisor" value="1">
+                <input type="hidden" name="target_supervisor_nid" id="sup-impersonate-nid" value="">
+                <div class="text-[11px] text-slate-300 leading-snug">
+                    <strong class="text-indigo-300 block">مشاهده پنل سرپرستی</strong>
+                    <span>ورود موقت به پنل سرپرست شبانه با حفظ نشست مدیر</span>
+                </div>
+                <button type="submit" class="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-md transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0">
+                    <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1" />
+                    </svg>
+                    <span>ورود به پنل سرپرست</span>
+                </button>
+            </form>
+            <?php endif; ?>
         </div>
     </div>
 
@@ -5122,8 +6960,9 @@ try {
 
                 <!-- Photo & Details -->
                 <div class="flex gap-4 items-center">
-                    <div class="w-24 h-32 rounded-xl overflow-hidden border-2 border-indigo-400/40 bg-slate-800 shrink-0 shadow-md">
-                        <img src="assets/images/student_sample_avatar_1790759772433.jpg" id="sc-photo" alt="تصویر دانشجو" class="w-full h-full object-cover">
+                    <div class="w-24 h-32 rounded-xl overflow-hidden border-2 border-indigo-400/40 bg-slate-800 shrink-0 shadow-md flex items-center justify-center">
+                        <img src="" id="sc-photo" alt="تصویر دانشجو" class="hidden w-full h-full object-cover">
+                        <div id="sc-photo-fallback" class="w-full h-full flex items-center justify-center text-3xl text-slate-300 bg-slate-800">🎓</div>
                     </div>
 
                     <div class="space-y-1.5 text-xs flex-1">
@@ -5174,7 +7013,143 @@ try {
                     </div>
                 </div>
             </div>
+
+            <?php if ($canImpersonateStudent): ?>
+            <form method="POST" class="no-print flex items-center justify-between gap-3 p-3 bg-indigo-950/50 border border-indigo-500/30 rounded-2xl">
+                <input type="hidden" name="action_impersonate_student" value="1">
+                <input type="hidden" name="target_student_id" id="sc-impersonate-sid" value="">
+                <div class="text-[11px] text-slate-300 leading-snug">
+                    <strong class="text-indigo-300 block">مشاهده پنل دانشجویی</strong>
+                    <span>ورود موقت به میزکار دانشجو با حفظ نشست مدیر</span>
+                </div>
+                <button type="submit" class="px-3.5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl text-xs font-bold shadow-md transition-all cursor-pointer flex items-center gap-1.5 whitespace-nowrap shrink-0">
+                    <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 16l-4-4m0 0l4-4m-4 4h14m-5 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h7a3 3 0 013 3v1" />
+                    </svg>
+                    <span>ورود به پنل دانشجو</span>
+                </button>
+            </form>
+            <?php endif; ?>
         </div>
+    </div>
+
+    <!-- ===================== MODAL: APPROVE GUEST REQUEST + ROOM ALLOCATION ===================== -->
+    <div id="guestApproveModal" onclick="if(event.target === this) closeGuestApproveModal()" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4 overflow-y-auto">
+        <div class="bg-[#1e293b] rounded-2xl p-6 max-w-lg w-full border border-emerald-500/40 shadow-2xl space-y-4 text-xs my-8">
+            <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+                <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                    <span>🛎</span>
+                    <span>تایید درخواست اقامت میهمان: <span id="grm-std-name" class="text-emerald-300"></span></span>
+                </h3>
+                <button type="button" onclick="closeGuestApproveModal()" class="text-slate-400 hover:text-white font-bold cursor-pointer">✕</button>
+            </div>
+
+            <div id="grm-applicant-warning" class="hidden p-3 bg-amber-950/60 border border-amber-500/40 rounded-xl text-amber-200 leading-relaxed">
+                <strong>توجه:</strong> این دانشجو از پیش متقاضی خوابگاه نبوده و به صورت موقت درخواست اقامت میهمان ثبت کرده است.
+            </div>
+
+            <form method="POST" action="?tab=guest_requests" class="space-y-4">
+                <input type="hidden" name="action_approve_guest_request" value="1">
+                <input type="hidden" name="request_id" id="grm-req-id" value="">
+
+                <div>
+                    <label class="block text-slate-300 font-bold mb-1">انتخاب اتاق مقصد *:</label>
+                    <select name="room_id" id="grm-room-select" required class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl outline-none focus:border-emerald-500">
+                        <option value="">-- انتخاب اتاق فعال خوابگاه --</option>
+                        <?php foreach ($allRooms as $rm): ?>
+                            <?php if (!empty($rm['is_active'])): ?>
+                                <option value="<?= (int)$rm['id'] ?>">
+                                    اتاق <?= htmlspecialchars((string)$rm['room_number']) ?> — <?= htmlspecialchars((string)$rm['floor']) ?> (ظرفیت خالی: <?= max(0, (int)($rm['free_beds'] ?? 0)) ?> از <?= (int)$rm['capacity'] ?> تخت)
+                                </option>
+                            <?php endif; ?>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+
+                <div>
+                    <label class="block text-slate-300 font-bold mb-1">تعداد روزهای اقامت میهمانی *:</label>
+                    <div class="flex gap-1.5 flex-wrap mb-2">
+                        <button type="button" onclick="setGuestReqDays(3)" class="px-2.5 py-1 bg-slate-900 hover:bg-emerald-600 border border-slate-700 text-white rounded-lg text-[11px] font-bold cursor-pointer">۳ روز</button>
+                        <button type="button" onclick="setGuestReqDays(7)" class="px-2.5 py-1 bg-slate-900 hover:bg-emerald-600 border border-slate-700 text-white rounded-lg text-[11px] font-bold cursor-pointer">۷ روز</button>
+                        <button type="button" onclick="setGuestReqDays(14)" class="px-2.5 py-1 bg-slate-900 hover:bg-emerald-600 border border-slate-700 text-white rounded-lg text-[11px] font-bold cursor-pointer">۱۴ روز</button>
+                        <button type="button" onclick="setGuestReqDays(30)" class="px-2.5 py-1 bg-slate-900 hover:bg-emerald-600 border border-slate-700 text-white rounded-lg text-[11px] font-bold cursor-pointer">۳۰ روز</button>
+                    </div>
+                    <input type="number" name="approved_days" id="grm-approved-days" value="7" min="1" max="180" required oninput="updateGuestReqEndPreview()" class="w-32 px-3 py-1.5 bg-slate-900 border border-emerald-500/50 text-white font-mono font-bold text-center rounded-xl outline-none">
+                    <span class="text-slate-400 mr-2">روز اقامت</span>
+                </div>
+
+                <?php
+                    list($gReqJy, $gReqJm, $gReqJd) = gregorian_to_jalali(intval(date('Y')), intval(date('n')), intval(date('j')));
+                    $gReqStartStr = sprintf('%04d/%02d/%02d', $gReqJy, $gReqJm, $gReqJd);
+                    $gReqEndStr = add_days_to_jalali_php($gReqStartStr, 7);
+                ?>
+                <div>
+                    <label class="block text-slate-300 font-bold mb-1">تاریخ شروع اقامت (شمسی) *:</label>
+                    <div class="grid grid-cols-3 gap-2">
+                        <select id="grm_start_day" name="guest_req_start_day" onchange="updateGuestReqEndPreview()" class="px-2.5 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl font-mono text-xs">
+                            <?php for ($d = 1; $d <= 31; $d++): ?>
+                                <option value="<?= sprintf('%02d', $d) ?>" <?= $d === $gReqJd ? 'selected' : '' ?>><?= $d ?></option>
+                            <?php endfor; ?>
+                        </select>
+                        <select id="grm_start_month" name="guest_req_start_month" onchange="updateGuestReqEndPreview()" class="px-2.5 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl text-xs">
+                            <?php
+                                $jReqMonths = [
+                                    1 => 'فروردین', 2 => 'اردیبهشت', 3 => 'خرداد',
+                                    4 => 'تیر', 5 => 'مرداد', 6 => 'شهریور',
+                                    7 => 'مهر', 8 => 'آبان', 9 => 'آذر',
+                                    10 => 'دی', 11 => 'بهمن', 12 => 'اسفند'
+                                ];
+                                foreach ($jReqMonths as $mIdx => $mLbl):
+                            ?>
+                                <option value="<?= sprintf('%02d', $mIdx) ?>" <?= $mIdx === $gReqJm ? 'selected' : '' ?>><?= $mLbl ?></option>
+                            <?php endforeach; ?>
+                        </select>
+                        <select id="grm_start_year" name="guest_req_start_year" onchange="updateGuestReqEndPreview()" class="px-2.5 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl font-mono text-xs">
+                            <?php for ($yOpt = max(1402, $gReqJy - 1); $yOpt <= max(1408, $gReqJy + 2); $yOpt++): ?>
+                                <option value="<?= $yOpt ?>" <?= $yOpt === $gReqJy ? 'selected' : '' ?>><?= toPersianDigits((string)$yOpt) ?></option>
+                            <?php endfor; ?>
+                        </select>
+                    </div>
+                    <div class="mt-2 p-2.5 bg-emerald-950/40 border border-emerald-500/30 rounded-xl flex items-center justify-between text-[11px]">
+                        <span class="text-slate-300">تاریخ پایان پیش‌بینی‌شده:</span>
+                        <strong id="grm-end-date-preview" class="font-mono text-emerald-300"><?= toPersianDigits($gReqEndStr) ?></strong>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-slate-300 font-bold mb-1">توضیح / یادداشت مدیر (اختیاری):</label>
+                    <textarea name="manager_note" rows="2" placeholder="توضیحات برای دانشجو..." class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl outline-none focus:border-emerald-500"></textarea>
+                </div>
+
+                <div class="flex justify-end gap-2 pt-2 border-t border-slate-700">
+                    <button type="button" onclick="closeGuestApproveModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl font-bold cursor-pointer">انصراف</button>
+                    <button type="submit" class="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-xl font-bold shadow-md cursor-pointer">تایید نهایی و تخصیص اتاق</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- ===================== MODAL: REJECT GUEST REQUEST ===================== -->
+    <div id="guestRejectModal" onclick="if(event.target === this) closeGuestRejectModal()" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/75 backdrop-blur-xs p-4">
+        <form method="POST" action="?tab=guest_requests" class="bg-[#1e293b] rounded-2xl p-6 max-w-md w-full border border-rose-500/40 shadow-2xl space-y-4 text-xs">
+            <input type="hidden" name="action_reject_guest_request" value="1">
+            <input type="hidden" name="request_id" id="grr-req-id" value="">
+
+            <div class="flex justify-between items-center border-b border-slate-700 pb-3">
+                <h3 class="text-sm font-bold text-rose-300">رد درخواست اقامت میهمان: <span id="grr-std-name" class="text-white"></span></h3>
+                <button type="button" onclick="closeGuestRejectModal()" class="text-slate-400 hover:text-white font-bold cursor-pointer">✕</button>
+            </div>
+
+            <div>
+                <label class="block text-slate-300 font-bold mb-1.5">دلیل رد درخواست (نمایش در پنل دانشجو):</label>
+                <textarea name="manager_note" rows="3" placeholder="مثال: عدم وجود ظرفیت خالی در تاریخ درخواستی..." class="w-full px-3 py-2 bg-slate-900 border border-slate-700 text-white rounded-xl outline-none focus:border-rose-500"></textarea>
+            </div>
+
+            <div class="flex justify-end gap-2 pt-2 border-t border-slate-700">
+                <button type="button" onclick="closeGuestRejectModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl font-bold cursor-pointer">انصراف</button>
+                <button type="submit" class="px-5 py-2 bg-rose-600 hover:bg-rose-500 text-white rounded-xl font-bold shadow-md cursor-pointer">ثبت رد درخواست</button>
+            </div>
+        </form>
     </div>
 
     <!-- ===================== MODAL: EDIT SUPERVISOR SHIFT ===================== -->
@@ -5916,9 +7891,82 @@ try {
         </div>
     </div>
 
+    <!-- ===================== MODAL: MANAGER POLICY PERMISSIONS ===================== -->
+    <div id="managerPolicyModal" onclick="if(event.target === this) closeManagerPolicyModal()" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 overflow-y-auto">
+        <form method="POST" action="?tab=supervisors" class="bg-[#0f172a] border border-indigo-500/40 rounded-2xl max-w-3xl w-full p-6 space-y-4 shadow-2xl max-h-[92vh] overflow-y-auto">
+            <input type="hidden" name="action_update_manager_permissions" value="1">
+            <input type="hidden" name="manager_id" id="policy-mgr-id" value="">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <div>
+                    <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                        <span>⚙️</span>
+                        <span>تنظیم سیاست دسترسی‌های مدیر: <span id="policy-mgr-name" class="text-indigo-300"></span></span>
+                    </h3>
+                    <p class="text-[11px] text-slate-400 mt-0.5 font-mono" id="policy-mgr-nid"></p>
+                </div>
+                <button type="button" onclick="closeManagerPolicyModal()" class="text-slate-400 hover:text-white text-lg cursor-pointer">✕</button>
+            </div>
+
+            <div class="flex items-center justify-between bg-slate-900/80 border border-slate-800 rounded-xl p-3 text-[11px]">
+                <span class="text-slate-300">فقط قابلیت‌هایی که خودتان مجاز هستید نمایش داده و اعمال می‌شوند:</span>
+                <div class="flex items-center gap-1.5 shrink-0">
+                    <button type="button" onclick="toggleMgrPolicyPerms(true)" class="px-2.5 py-1 bg-indigo-600/30 hover:bg-indigo-600 text-indigo-300 hover:text-white rounded-lg font-bold cursor-pointer">انتخاب همه</button>
+                    <button type="button" onclick="toggleMgrPolicyPerms(false)" class="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg font-bold cursor-pointer">حذف همه</button>
+                </div>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <?php foreach ($grantableManagerCatalog as $permItem): ?>
+                    <label class="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-900/80 border border-slate-800 hover:border-indigo-500/40 cursor-pointer transition-colors">
+                        <input type="checkbox" name="mgr_permissions[]" value="<?= htmlspecialchars($permItem['permission_key']) ?>" class="mgr-policy-checkbox mt-0.5 rounded border-slate-700 bg-slate-900 text-indigo-500 focus:ring-indigo-500">
+                        <div class="min-w-0">
+                            <div class="text-xs font-bold text-slate-200 leading-snug"><?= htmlspecialchars($permItem['permission_label']) ?></div>
+                            <div class="text-[10px] font-mono text-slate-500 mt-0.5"><?= htmlspecialchars($permItem['permission_key']) ?></div>
+                        </div>
+                    </label>
+                <?php endforeach; ?>
+            </div>
+
+            <div class="flex items-center justify-end gap-2 pt-3 border-t border-slate-800">
+                <button type="button" onclick="closeManagerPolicyModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold rounded-xl cursor-pointer">انصراف</button>
+                <button type="submit" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl shadow-md cursor-pointer">ذخیره و اعمال سیاست دسترسی</button>
+            </div>
+        </form>
+    </div>
+
+    <!-- ===================== MODAL: DELETE MANAGER WITH STATIC 10-CHAR SECRET ===================== -->
+    <div id="deleteManagerSecretModal" onclick="if(event.target === this) closeDeleteManagerSecretModal()" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4 overflow-y-auto">
+        <form method="POST" action="?tab=supervisors" class="bg-[#0f172a] border border-rose-500/40 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <input type="hidden" name="action_delete_manager" value="1">
+            <input type="hidden" name="manager_id" id="del-mgr-id" value="">
+            <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+                <h3 class="text-sm font-bold text-rose-300 flex items-center gap-2">
+                    <span>🛡</span>
+                    <span>تایید امنیتی حذف کاربر مدیر</span>
+                </h3>
+                <button type="button" onclick="closeDeleteManagerSecretModal()" class="text-slate-400 hover:text-white text-lg cursor-pointer">✕</button>
+            </div>
+
+            <div class="p-3 bg-rose-950/30 border border-rose-500/30 rounded-xl text-xs text-slate-200 space-y-1">
+                <div>کاربر انتخابی برای حذف: <strong id="del-mgr-name" class="text-white"></strong></div>
+                <div class="font-mono text-[11px] text-rose-300" id="del-mgr-nid"></div>
+            </div>
+
+            <div>
+                <label class="block text-xs font-bold text-slate-300 mb-1.5">رمز ثابت ۱۰ رقمی حذف مدیر *</label>
+                <input type="password" name="delete_manager_secret" id="del-mgr-secret-input" maxlength="10" autocomplete="off" required placeholder="رمز ۱۰ کاراکتری امنیتی را وارد کنید" class="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 focus:border-rose-500 text-white rounded-xl text-xs font-mono outline-none" dir="ltr">
+            </div>
+
+            <div class="flex items-center justify-end gap-2 pt-2 border-t border-slate-800">
+                <button type="button" onclick="closeDeleteManagerSecretModal()" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-bold rounded-xl cursor-pointer">انصراف</button>
+                <button type="submit" class="px-5 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold rounded-xl shadow-md cursor-pointer">تایید و حذف مدیر</button>
+            </div>
+        </form>
+    </div>
+
     <!-- ===================== JAVASCRIPT TAB SWITCHING & MODALS ===================== -->
     <script>
-        const tabs = ['overview', 'admitted', 'unhoused', 'rooms', 'dormgraph', 'facilities', 'maintenance', 'cleanliness', 'students', 'attendance', 'supervisors', 'festivals', 'skills', 'welfare', 'authjwt'];
+        const tabs = <?= json_encode(array_values($allowedManagerTabs), JSON_UNESCAPED_UNICODE) ?>;
         const tabTitles = {
             'overview': 'پیشخوان و داشبورد مدیریتی صمد',
             'admitted': 'پذیرش دانشجوی جدید در جدول منبع (admitted_students)',
@@ -5929,6 +7977,7 @@ try {
             'maintenance': 'کارتابل خرابی، درخواست تعمیر/تعویض و فاکتورهای مالی',
             'cleanliness': 'ارزیابی کیفیت بهداشت و رتبه‌بندی عملکرد نظافت خوابگاه',
             'students': 'فهرست دانشجویان اسکان‌یافته و مدیریت میهمانان',
+            'guest_requests': 'کارتابل بررسی و تایید درخواست‌های اقامت میهمان دانشجویان',
             'attendance': 'بررسی سرشماری شبانه خوابگاه و صدور کارنامه تردد',
             'supervisors': 'مدیریت مدیران کل، سرپرستان خوابگاه و شیفت‌های کاری',
             'festivals': 'سامانه جشنواره‌ها، المپیادها و داوطلبان دانشجویی',
@@ -5957,6 +8006,40 @@ try {
             });
         }
 
+        function filterStudentLimitsTable() {
+            const q = (document.getElementById('studentLimitSearchInput')?.value || '').trim().toLowerCase();
+            const cat = document.getElementById('studentLimitCategoryFilter')?.value || 'all';
+            document.querySelectorAll('#studentLimitsTable tbody tr.student-limit-row').forEach(tr => {
+                const rowCat = tr.getAttribute('data-category') || '';
+                const rowSearch = tr.getAttribute('data-search') || '';
+                const matchCat = (cat === 'all' || rowCat === cat);
+                const matchText = (!q || rowSearch.includes(q));
+                tr.style.display = (matchCat && matchText) ? '' : 'none';
+            });
+        }
+
+        function setActionWindowDays(inputId, days) {
+            const inp = document.getElementById(inputId);
+            if (inp) {
+                inp.value = days;
+                inp.focus();
+            }
+        }
+
+        function syncStudentLimitBadge(checkbox) {
+            const labelEl = checkbox?.parentElement?.querySelector('.limit-status-label');
+            if (!labelEl) return;
+            if (checkbox.checked) {
+                labelEl.textContent = 'محدودیت فعال';
+                labelEl.classList.remove('text-slate-400');
+                labelEl.classList.add('text-amber-300');
+            } else {
+                labelEl.textContent = 'نامحدود';
+                labelEl.classList.remove('text-amber-300');
+                labelEl.classList.add('text-slate-400');
+            }
+        }
+
         function openJwtPayloadModal(data) {
             const modal = document.getElementById('jwtPayloadModal');
             const body = document.getElementById('jwtPayloadJsonBody');
@@ -5970,15 +8053,24 @@ try {
                 payload: data.payload,
                 effectivePermissions: data.permissions
             }, null, 2);
+            modal.style.display = '';
+            modal.classList.add('flex');
             modal.classList.remove('hidden');
         }
 
         function closeJwtPayloadModal() {
             const modal = document.getElementById('jwtPayloadModal');
-            if (modal) modal.classList.add('hidden');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                modal.style.display = '';
+            }
         }
 
         function switchTab(tabId) {
+            if (!tabs.includes(tabId) && tabs.length > 0) {
+                tabId = tabs[0];
+            }
             tabs.forEach(t => {
                 const pane = document.getElementById('tab-' + t);
                 const btn = document.getElementById('nav-' + t);
@@ -6014,14 +8106,17 @@ try {
             const initialTab = urlParams.get('tab') || '<?= htmlspecialchars($active_tab) ?>';
             if (tabs.includes(initialTab)) {
                 switchTab(initialTab);
-            } else {
-                switchTab('overview');
+            } else if (tabs.length > 0) {
+                switchTab(tabs[0]);
             }
             if (typeof updateGuestEndDatePreview === 'function') {
                 updateGuestEndDatePreview();
             }
             if (typeof updateCallDatesPreview === 'function') {
                 updateCallDatesPreview();
+            }
+            if (typeof switchCleanView === 'function') {
+                switchCleanView('<?= htmlspecialchars($cleanViewMode, ENT_QUOTES) ?>');
             }
         });
 
@@ -6093,9 +8188,17 @@ try {
         }
 
         // مودال کارت سرپرست
-        function openSupervisorCardModal(name, nid) {
+        function openSupervisorCardModal(name, nid, shiftDays, shiftHours) {
             document.getElementById('sup-card-name').textContent = name;
             document.getElementById('sup-card-nid').textContent = nid;
+            const daysEl = document.getElementById('sup-card-shift-days');
+            if (daysEl) daysEl.textContent = shiftDays || 'شنبه تا چهارشنبه';
+            const hoursEl = document.getElementById('sup-card-shift-hours');
+            if (hoursEl) hoursEl.textContent = shiftHours || '۲۲:۰۰ الی ۰۶:۰۰ (شبانه)';
+            const idCodeEl = document.getElementById('sup-card-id-code');
+            if (idCodeEl) idCodeEl.textContent = 'SUP-' + (nid || 'OFFICIAL');
+            const impSupNid = document.getElementById('sup-impersonate-nid');
+            if (impSupNid) impSupNid.value = nid || '';
             document.getElementById('supervisorCardModal').classList.remove('hidden');
         }
         function closeSupervisorCardModal() {
@@ -6132,15 +8235,18 @@ try {
             const hintEl = document.getElementById('add-admin-role-hint');
             const submitBtn = document.getElementById('add-admin-submit-btn');
 
+            const permsBox = document.getElementById('mgr-permissions-box');
+
             if (!roleInput) return;
             roleInput.value = role;
 
             if (role === 'manager') {
+                if (permsBox) permsBox.classList.remove('hidden');
                 supBtn.className = 'px-3 py-1.5 rounded-lg font-bold text-slate-300 hover:text-white transition-all cursor-pointer';
                 mgrBtn.className = 'px-3 py-1.5 rounded-lg font-bold bg-indigo-600 text-white transition-all cursor-pointer';
                 iconEl.textContent = '👔';
-                titleEl.textContent = 'افزودن کاربر مدیر کل (دسترسی کامل داشبورد)';
-                subtitleEl.textContent = 'کاربر مدیر کل با کد ملی و کلمه عبور وارد داشبورد مدیریت کل می‌شود';
+                titleEl.textContent = 'افزودن کاربر مدیر و تنظیم سیاست دسترسی';
+                subtitleEl.textContent = 'کاربر مدیر با کد ملی و کلمه عبور و مجوزهای تفویض‌شده وارد داشبورد مدیریت می‌شود';
                 nameLabel.textContent = 'نام، نام خانوادگی و سمت مدیر *';
                 nameInput.placeholder = 'مثال: مهندس مهدی کریمی (معاون دانشجویی)';
                 daysLabel.textContent = 'روزهای حضور اداری *';
@@ -6149,10 +8255,11 @@ try {
                 if (hoursInput.value === '۲۲:۰۰ الی ۰۶:۰۰ (شیفت شب)') hoursInput.value = '۰۸:۰۰ الی ۱۶:۰۰ (اداری)';
                 if (passInput.value === 'Super@12345') passInput.value = 'Admin@12345';
                 hintEl.className = 'text-[11px] text-indigo-300 font-semibold';
-                hintEl.textContent = 'نقش انتخابی: مدیر کل (دسترسی کامل به تمامی تب‌ها، آمار و توکن‌ها)';
+                hintEl.textContent = 'نقش انتخابی: مدیر (بر اساس دسترسی‌های انتخاب‌شده در بخش سیاست دسترسی)';
                 submitBtn.className = 'px-5 py-2.5 bg-gradient-to-r from-indigo-600 to-indigo-500 hover:from-indigo-500 hover:to-indigo-400 text-white font-bold rounded-xl text-xs shadow-md transition-all cursor-pointer';
-                submitBtn.textContent = '+ ثبت کاربر مدیر کل و صدور دسترسی';
+                submitBtn.textContent = '+ ثبت کاربر مدیر و صدور دسترسی';
             } else {
+                if (permsBox) permsBox.classList.add('hidden');
                 mgrBtn.className = 'px-3 py-1.5 rounded-lg font-bold text-slate-300 hover:text-white transition-all cursor-pointer';
                 supBtn.className = 'px-3 py-1.5 rounded-lg font-bold bg-amber-500 text-slate-950 transition-all cursor-pointer';
                 iconEl.textContent = '🛡';
@@ -6170,6 +8277,97 @@ try {
                 submitBtn.className = 'px-5 py-2.5 bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 text-slate-950 font-bold rounded-xl text-xs shadow-md transition-all cursor-pointer';
                 submitBtn.textContent = '+ ثبت سرپرست جدید و صدور دسترسی';
             }
+        }
+
+        function toggleMgrCreatePerms(checkedState) {
+            document.querySelectorAll('#mgr-permissions-box .mgr-create-perm-cb').forEach(cb => {
+                cb.checked = !!checkedState;
+            });
+        }
+
+        function toggleMgrPolicyPerms(checkedState) {
+            document.querySelectorAll('#managerPolicyModal .mgr-policy-checkbox').forEach(cb => {
+                cb.checked = !!checkedState;
+            });
+        }
+
+        function openManagerPolicyModalFromBtn(btn) {
+            if (!btn) return;
+            const mgrId = btn.getAttribute('data-mgr-id') || '';
+            const mgrName = btn.getAttribute('data-mgr-name') || '';
+            const mgrNid = btn.getAttribute('data-mgr-nid') || '';
+            let perms = [];
+            try {
+                perms = JSON.parse(btn.getAttribute('data-mgr-perms') || '[]');
+            } catch (e) {
+                perms = [];
+            }
+            openManagerPolicyModal(mgrId, mgrName, mgrNid, perms);
+        }
+
+        function openManagerPolicyModal(mgrId, mgrName, mgrNid, currentPerms) {
+            const modal = document.getElementById('managerPolicyModal');
+            if (!modal) return;
+            document.getElementById('policy-mgr-id').value = mgrId;
+            document.getElementById('policy-mgr-name').textContent = mgrName || '';
+            document.getElementById('policy-mgr-nid').textContent = 'کد ملی: ' + (mgrNid || '');
+            const permsSet = new Set(Array.isArray(currentPerms) ? currentPerms : []);
+            modal.querySelectorAll('.mgr-policy-checkbox').forEach(cb => {
+                cb.checked = permsSet.has(cb.value);
+            });
+            modal.style.display = '';
+            modal.classList.add('flex');
+            modal.classList.remove('hidden');
+        }
+
+        function closeManagerPolicyModal() {
+            const modal = document.getElementById('managerPolicyModal');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                modal.style.display = '';
+            }
+        }
+
+        function openDeleteManagerSecretModalFromBtn(btn) {
+            if (!btn) return;
+            openDeleteManagerSecretModal(
+                btn.getAttribute('data-mgr-id') || '',
+                btn.getAttribute('data-mgr-name') || '',
+                btn.getAttribute('data-mgr-nid') || ''
+            );
+        }
+
+        function openDeleteManagerSecretModal(mgrId, mgrName, mgrNid) {
+            const modal = document.getElementById('deleteManagerSecretModal');
+            if (!modal) return;
+            document.getElementById('del-mgr-id').value = mgrId;
+            document.getElementById('del-mgr-name').textContent = mgrName || '';
+            document.getElementById('del-mgr-nid').textContent = 'کد ملی: ' + (mgrNid || '');
+            const inp = document.getElementById('del-mgr-secret-input');
+            if (inp) inp.value = '';
+            modal.style.display = '';
+            modal.classList.add('flex');
+            modal.classList.remove('hidden');
+            if (inp) setTimeout(() => inp.focus(), 50);
+        }
+
+        function closeDeleteManagerSecretModal() {
+            const modal = document.getElementById('deleteManagerSecretModal');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.classList.remove('flex');
+                modal.style.display = '';
+            }
+        }
+
+        function exportDormReportExcel(type, roomSelectId, rangeSelectId) {
+            const roomVal = document.getElementById(roomSelectId)?.value || 'all';
+            const rangeVal = document.getElementById(rangeSelectId)?.value || '7d';
+            const url = 'export_excel.php?type=' + encodeURIComponent(type)
+                + '&room=' + encodeURIComponent(roomVal)
+                + '&range=' + encodeURIComponent(rangeVal);
+            window.location.href = url;
         }
 
         // مودال پرونده کامل اتاق و ساکنین
@@ -6203,10 +8401,13 @@ try {
 
                     const row = document.createElement('div');
                     row.className = 'p-4 bg-slate-900/90 rounded-xl border border-slate-700/80 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4';
+                    const avatarHtml = occ.photo_path
+                        ? `<img src="${occ.photo_path}" alt="${occ.full_name}" class="w-full h-full object-cover">`
+                        : `<div class="w-full h-full flex items-center justify-center text-2xl bg-slate-800 text-slate-300">🎓</div>`;
                     row.innerHTML = `
                         <div class="flex items-center gap-3">
                             <div class="w-14 h-16 rounded-xl overflow-hidden border border-emerald-500/30 bg-slate-800 shrink-0">
-                                <img src="assets/images/student_sample_avatar_1790759772433.jpg" alt="${occ.full_name}" class="w-full h-full object-cover">
+                                ${avatarHtml}
                             </div>
                             <div class="space-y-1 text-xs">
                                 <div class="flex items-center gap-2">
@@ -6235,7 +8436,7 @@ try {
 
                         <div class="flex sm:flex-col items-center sm:items-end gap-2 shrink-0 w-full sm:w-auto justify-between border-t sm:border-t-0 pt-2 sm:pt-0 border-slate-800">
                             <span class="text-[11px] text-slate-400 font-mono">
-                                📞 ${occ.mobile || '۰۹۱۲۰۰۰۰۰۰۰'}
+                                📞 ${occ.mobile || '-'}
                             </span>
                             <button type="button" onclick='openStudentCardModal(${cardDataJson})' class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition-all shadow-md cursor-pointer flex items-center gap-1">
                                 <span>کارت دانشجویی 🪪</span>
@@ -6277,6 +8478,26 @@ try {
             document.getElementById('sc-nid').textContent = student.national_id || student.nationalId || '';
             document.getElementById('sc-field').textContent = student.field_of_study || student.fieldOfStudy || 'فنی و مهندسی';
             document.getElementById('sc-campus').textContent = student.campus || 'پردیس فناوری صمد';
+
+            const photoEl = document.getElementById('sc-photo');
+            const fallbackEl = document.getElementById('sc-photo-fallback');
+            const photoPath = student.photo_path || student.photoPath || '';
+            if (photoEl && fallbackEl) {
+                if (photoPath) {
+                    photoEl.src = photoPath;
+                    photoEl.classList.remove('hidden');
+                    fallbackEl.classList.add('hidden');
+                } else {
+                    photoEl.src = '';
+                    photoEl.classList.add('hidden');
+                    fallbackEl.classList.remove('hidden');
+                }
+            }
+
+            const impSidEl = document.getElementById('sc-impersonate-sid');
+            if (impSidEl) {
+                impSidEl.value = student.student_id || student.studentId || '';
+            }
 
             const roomNo = student.room_number || student.roomNumber;
             const floor = student.floor || '';
@@ -6341,6 +8562,63 @@ try {
                     r.style.display = 'none';
                 }
             });
+        }
+
+        function purgeSingleUnhousedStudent(studentId, fullName) {
+            if (!studentId) return;
+            if (!confirm('هشدار: با تایید این عملیات، دانشجو «' + fullName + '» به صورت کامل و غیرقابل بازگشت از تمامی جداول و پایگاه داده سامانه حذف می‌شود و هیچ اثری از ایشان باقی نخواهد ماند. آیا مطمئن هستید؟')) {
+                return;
+            }
+            const form = document.getElementById('unhousedSinglePurgeForm');
+            const inp = document.getElementById('unhousedSinglePurgeStudentId');
+            if (form && inp) {
+                inp.value = studentId;
+                form.submit();
+            }
+        }
+
+        function toggleAllUnhousedCheckboxes(master) {
+            const checked = !!(master && master.checked);
+            document.querySelectorAll('.unhoused-row-check').forEach(cb => {
+                const row = cb.closest('tr');
+                if (!row || row.style.display !== 'none') {
+                    cb.checked = checked;
+                }
+            });
+            updateUnhousedSelectedCount();
+        }
+
+        function updateUnhousedSelectedCount() {
+            const checkedBoxes = document.querySelectorAll('.unhoused-row-check:checked');
+            const countEl = document.getElementById('unhousedSelectedCount');
+            const btnEl = document.getElementById('unhousedBulkPurgeBtn');
+            const cnt = checkedBoxes.length;
+            if (countEl) countEl.textContent = cnt;
+            if (btnEl) {
+                if (cnt > 0) btnEl.classList.remove('hidden');
+                else btnEl.classList.add('hidden');
+            }
+        }
+
+        function submitSelectedUnhousedPurge() {
+            const checkedBoxes = Array.from(document.querySelectorAll('.unhoused-row-check:checked'));
+            if (checkedBoxes.length === 0) return;
+            if (!confirm('هشدار: تعداد ' + checkedBoxes.length + ' دانشجوی انتخاب‌شده به صورت کامل و غیرقابل بازگشت از تمامی جداول و پایگاه داده سامانه حذف می‌شوند و هیچ اثری از آن‌ها باقی نخواهد ماند. ادامه می‌دهید؟')) {
+                return;
+            }
+            const form = document.getElementById('unhousedBulkPurgeForm');
+            const container = document.getElementById('unhousedBulkPurgeInputs');
+            if (form && container) {
+                container.innerHTML = '';
+                checkedBoxes.forEach(cb => {
+                    const hid = document.createElement('input');
+                    hid.type = 'hidden';
+                    hid.name = 'student_ids[]';
+                    hid.value = cb.value;
+                    container.appendChild(hid);
+                });
+                form.submit();
+            }
         }
 
         // فیلتر اتاق‌ها و طبقات (Tab 4)
@@ -6471,6 +8749,63 @@ try {
                     r.style.display = 'none';
                 }
             });
+        }
+
+        function deleteSingleAttendance(attId, studentName) {
+            if (!attId) return;
+            if (!confirm('آیا از حذف رکورد سرشماری شبانه «' + studentName + '» اطمینان دارید؟')) {
+                return;
+            }
+            const form = document.getElementById('attSingleDeleteForm');
+            const inp = document.getElementById('attSingleDeleteId');
+            if (form && inp) {
+                inp.value = attId;
+                form.submit();
+            }
+        }
+
+        function toggleAllAttCheckboxes(master) {
+            const checked = !!(master && master.checked);
+            document.querySelectorAll('.att-row-check').forEach(cb => {
+                const row = cb.closest('tr');
+                if (!row || row.style.display !== 'none') {
+                    cb.checked = checked;
+                }
+            });
+            updateAttSelectedCount();
+        }
+
+        function updateAttSelectedCount() {
+            const checkedBoxes = document.querySelectorAll('.att-row-check:checked');
+            const countEl = document.getElementById('attSelectedCount');
+            const btnEl = document.getElementById('attBulkSelectedBtn');
+            const cnt = checkedBoxes.length;
+            if (countEl) countEl.textContent = cnt;
+            if (btnEl) {
+                if (cnt > 0) btnEl.classList.remove('hidden');
+                else btnEl.classList.add('hidden');
+            }
+        }
+
+        function submitSelectedAttendanceDelete() {
+            const checkedBoxes = Array.from(document.querySelectorAll('.att-row-check:checked'));
+            if (checkedBoxes.length === 0) return;
+            if (!confirm('آیا از حذف ' + checkedBoxes.length + ' رکورد انتخاب‌شده سرشماری اطمینان دارید؟')) {
+                return;
+            }
+            const form = document.getElementById('attBulkDeleteForm');
+            const container = document.getElementById('attBulkDeleteInputs');
+            if (form && container) {
+                container.innerHTML = '';
+                checkedBoxes.forEach(cb => {
+                    const hid = document.createElement('input');
+                    hid.type = 'hidden';
+                    hid.name = 'attendance_ids[]';
+                    hid.value = cb.value;
+                    container.appendChild(hid);
+                });
+                form.submit();
+            }
         }
 
         // فیلتر داوطلبان جشنواره‌ها (Tab 8)
@@ -6681,7 +9016,8 @@ try {
                 }
             }
 
-            const actVal = rep.resolution_action || rep.action_taken || (rep.maintenance_type === 'replacement' || rep.maintenance_type === 'تعویض / خرید جدید' ? 'replacement' : 'repair');
+            const rawAct = String(rep.resolution_action || rep.action_taken || rep.maintenance_type || '');
+            const actVal = (rawAct === 'replacement' || rawAct.includes('خرید') || rawAct.includes('تعویض')) ? 'replacement' : 'repair';
             setVal('mrm-action-taken', actVal);
             setVal('mrm-cost', rep.cost_rials || rep.resolution_cost || '');
             setVal('mrm-inv-num', rep.invoice_number || ('INV-1403-' + rep.id));
@@ -6720,7 +9056,7 @@ try {
             const cost = parseInt(rep.cost_rials || rep.resolution_cost || 0);
             setText('sim-cost', cost.toLocaleString());
             setText('sim-notes', rep.resolution_notes || rep.description || 'اقدام فنی لازم توسط پیمانکار مجاز صورت گرفت و تحویل شد.');
-            setText('sim-manager', rep.resolved_by_manager_name || rep.resolved_by || 'دکتر علیرضا حسینی (مدیر امور رفاهی و دانشجویی)');
+            setText('sim-manager', rep.resolved_by_manager_name || rep.resolved_by || 'مدیر امور دانشجویی و رفاهی');
 
             const editBtn = document.getElementById('sim-edit-btn');
             if (editBtn) {
@@ -6830,6 +9166,9 @@ try {
             const hisPane = document.getElementById('cleanViewHistory');
             const rkBtn = document.getElementById('btn-clean-ranking');
             const hisBtn = document.getElementById('btn-clean-history');
+            const dateViewInp = document.getElementById('cleanDeleteDateViewInput');
+            const allViewInp = document.getElementById('cleanDeleteAllViewInput');
+            if (!rkPane || !hisPane || !rkBtn || !hisBtn) return;
 
             if (mode === 'ranking') {
                 rkPane.classList.remove('hidden');
@@ -6841,6 +9180,75 @@ try {
                 hisPane.classList.remove('hidden');
                 hisBtn.className = 'px-3 py-1.5 rounded-xl text-xs font-bold bg-emerald-600 text-white cursor-pointer transition-all';
                 rkBtn.className = 'px-3 py-1.5 rounded-xl text-xs font-bold bg-slate-800 text-slate-300 hover:text-white cursor-pointer transition-all';
+            }
+            if (dateViewInp) dateViewInp.value = mode;
+            if (allViewInp) allViewInp.value = mode;
+        }
+
+        function deleteSingleCleanliness(recId, roomNumber, inspDate) {
+            if (!recId) return;
+            if (!confirm('آیا از حذف گزارش نظافت اتاق ' + roomNumber + ' در تاریخ ' + inspDate + ' اطمینان دارید؟')) {
+                return;
+            }
+            const form = document.getElementById('cleanSingleDeleteForm');
+            const inp = document.getElementById('cleanSingleDeleteId');
+            if (form && inp) {
+                inp.value = recId;
+                form.submit();
+            }
+        }
+
+        function deleteRoomCleanliness(roomNumber, cnt) {
+            if (!roomNumber) return;
+            if (!confirm('آیا از حذف تمامی سوابق ارزیابی نظافت اتاق ' + roomNumber + ' (' + cnt + ' رکورد) اطمینان دارید؟')) {
+                return;
+            }
+            const form = document.getElementById('cleanRoomDeleteForm');
+            const inp = document.getElementById('cleanRoomDeleteNumber');
+            if (form && inp) {
+                inp.value = roomNumber;
+                form.submit();
+            }
+        }
+
+        function toggleAllCleanCheckboxes(master) {
+            const checked = !!(master && master.checked);
+            document.querySelectorAll('.clean-row-check').forEach(cb => {
+                cb.checked = checked;
+            });
+            updateCleanSelectedCount();
+        }
+
+        function updateCleanSelectedCount() {
+            const checkedBoxes = document.querySelectorAll('.clean-row-check:checked');
+            const countEl = document.getElementById('cleanSelectedCount');
+            const btnEl = document.getElementById('cleanBulkSelectedBtn');
+            const cnt = checkedBoxes.length;
+            if (countEl) countEl.textContent = cnt;
+            if (btnEl) {
+                if (cnt > 0) btnEl.classList.remove('hidden');
+                else btnEl.classList.add('hidden');
+            }
+        }
+
+        function submitSelectedCleanlinessDelete() {
+            const checkedBoxes = Array.from(document.querySelectorAll('.clean-row-check:checked'));
+            if (checkedBoxes.length === 0) return;
+            if (!confirm('آیا از حذف ' + checkedBoxes.length + ' رکورد انتخاب‌شده نظافت اطمینان دارید؟')) {
+                return;
+            }
+            const form = document.getElementById('cleanBulkDeleteForm');
+            const container = document.getElementById('cleanBulkDeleteInputs');
+            if (form && container) {
+                container.innerHTML = '';
+                checkedBoxes.forEach(cb => {
+                    const hid = document.createElement('input');
+                    hid.type = 'hidden';
+                    hid.name = 'record_ids[]';
+                    hid.value = cb.value;
+                    container.appendChild(hid);
+                });
+                form.submit();
             }
         }
 
@@ -7407,15 +9815,110 @@ try {
             }
         });
 
+        // ===================== GUEST REQUESTS APPROVAL / REJECT JS =====================
+        function filterGuestRequestsTable() {
+            const q = (document.getElementById('guestReqSearchInput')?.value || '').trim().toLowerCase();
+            const st = document.getElementById('guestReqStatusFilter')?.value || 'all';
+            document.querySelectorAll('.guest-req-row').forEach(row => {
+                const rowSt = row.getAttribute('data-status') || '';
+                const rowSearch = (row.getAttribute('data-search') || '').toLowerCase();
+                const matchSt = (st === 'all') || (rowSt === st);
+                const matchQ = (!q) || rowSearch.includes(q);
+                row.style.display = (matchSt && matchQ) ? '' : 'none';
+            });
+        }
+
+        function openGuestApproveModal(req) {
+            if (!req) return;
+            const m = document.getElementById('guestApproveModal');
+            if (!m) return;
+            document.getElementById('grm-req-id').value = req.id || '';
+            document.getElementById('grm-std-name').textContent = (req.full_name || '') + ' (' + (req.student_id || '') + ')';
+            const daysInp = document.getElementById('grm-approved-days');
+            if (daysInp) daysInp.value = req.requested_days || 7;
+            const warnEl = document.getElementById('grm-applicant-warning');
+            if (warnEl) {
+                if (Number(req.was_dorm_applicant) === 0) {
+                    warnEl.classList.remove('hidden');
+                } else {
+                    warnEl.classList.add('hidden');
+                }
+            }
+            updateGuestReqEndPreview();
+            m.classList.remove('hidden');
+            m.classList.add('flex');
+            m.style.display = 'flex';
+        }
+
+        function closeGuestApproveModal() {
+            const m = document.getElementById('guestApproveModal');
+            if (m) {
+                m.classList.add('hidden');
+                m.classList.remove('flex');
+                m.style.display = 'none';
+            }
+        }
+
+        function setGuestReqDays(days) {
+            const inp = document.getElementById('grm-approved-days');
+            if (inp) {
+                inp.value = days;
+                updateGuestReqEndPreview();
+            }
+        }
+
+        function updateGuestReqEndPreview() {
+            const daySel = document.getElementById('grm_start_day');
+            const monthSel = document.getElementById('grm_start_month');
+            const yearSel = document.getElementById('grm_start_year');
+            const daysInp = document.getElementById('grm-approved-days');
+            const outEl = document.getElementById('grm-end-date-preview');
+            if (!daySel || !monthSel || !yearSel || !daysInp || !outEl) return;
+
+            const day = parseInt(daySel.value, 10) || 1;
+            const month = parseInt(monthSel.value, 10) || 1;
+            const year = parseInt(yearSel.value, 10) || 1405;
+            const days = Math.max(1, parseInt(daysInp.value, 10) || 7);
+
+            const g = jalaliToGregorian(year, month, day);
+            const d = new Date(g.gy, g.gm - 1, g.gd);
+            d.setDate(d.getDate() + days);
+            const endJ = gregorianToJalali(d.getFullYear(), d.getMonth() + 1, d.getDate());
+            const endMm = endJ.jm < 10 ? '0' + endJ.jm : '' + endJ.jm;
+            const endDd = endJ.jd < 10 ? '0' + endJ.jd : '' + endJ.jd;
+            outEl.textContent = `${endJ.jy}/${endMm}/${endDd}`;
+        }
+
+        function openGuestRejectModal(reqId, fullName) {
+            const m = document.getElementById('guestRejectModal');
+            if (!m) return;
+            document.getElementById('grr-req-id').value = reqId || '';
+            document.getElementById('grr-std-name').textContent = fullName || '';
+            m.classList.remove('hidden');
+            m.classList.add('flex');
+            m.style.display = 'flex';
+        }
+
+        function closeGuestRejectModal() {
+            const m = document.getElementById('guestRejectModal');
+            if (m) {
+                m.classList.add('hidden');
+                m.classList.remove('flex');
+                m.style.display = 'none';
+            }
+        }
+
         // بستن هر یک از مودال‌ها با فشردن کلید Escape
         window.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
                 const modalIds = [
                     'assignModal', 'editDormModal', 'batchPrintModal', 'individualPrintModal',
                     'supervisorCardModal', 'roomDetailsModal', 'studentCardModal',
+                    'guestApproveModal', 'guestRejectModal',
                     'editSupervisorShiftModal', 'facilitiesModal', 'maintenanceResolutionModal',
                     'singleInvoiceModal', 'maintenanceInvoicePrintModal', 'cleanlinessPrintModal', 'createFestivalCallModal',
-                    'teamLockModal', 'blockSlotModal', 'cancelSlotModal', 'gymPrintModal'
+                    'teamLockModal', 'blockSlotModal', 'cancelSlotModal', 'gymPrintModal',
+                    'jwtPayloadModal', 'managerPolicyModal', 'deleteManagerSecretModal'
                 ];
                 modalIds.forEach(id => {
                     const m = document.getElementById(id);

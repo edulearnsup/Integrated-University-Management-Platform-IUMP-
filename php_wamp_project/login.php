@@ -5,7 +5,7 @@
  * ۱. ورود مدیر کل دانشگاه -> هدایت به manager_panel.php
  * ۲. ورود سرپرست شیفت شب -> هدایت به supervisor_panel.php
  * ۳. ورود دانشجو -> هدایت به dashboard.php
- * ۴. لاگین سریع ۱-کلیکی برای هر نقش جهت تست و داوری
+ * ۴. لاگین سریع ۱-کلیکی مدیر ارشد سامانه (Admin)
  * ۵. مودال بازیابی کلمه عبور و ورود با پیامک یکبارمصرف (OTP)
  */
 session_start();
@@ -48,6 +48,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmtMob->execute([$mobile]);
             $student = $stmtMob->fetch();
             if ($student) {
+                unset($_SESSION['samad_impersonate_student'], $_SESSION['samad_impersonate_supervisor']);
                 $_SESSION['student_id']   = $student['student_id'];
                 $_SESSION['national_id']  = $student['national_id'];
                 $_SESSION['student_name'] = $student['full_name'];
@@ -90,6 +91,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     ($admin['role'] === 'manager' && ($password === 'Admin@12345' || $password === 'manager123')) ||
                     ($admin['role'] === 'supervisor' && ($password === 'Super@12345' || $password === 'night123'))) {
                     
+                    unset($_SESSION['samad_impersonate_student'], $_SESSION['samad_impersonate_supervisor']);
                     $_SESSION['admin_id'] = $admin['id'];
                     $_SESSION['admin_national_id'] = $admin['national_id'];
                     $_SESSION['admin_name'] = $admin['full_name'];
@@ -121,6 +123,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 $student = $stmtStudent->fetch();
 
                 if ($student && (password_verify($password, $student['password_hash']) || $password === 'Samad@2026!' || $password === 'Student@1234')) {
+                    unset($_SESSION['samad_impersonate_student'], $_SESSION['samad_impersonate_supervisor']);
                     $_SESSION['student_id']   = $student['student_id'];
                     $_SESSION['national_id']  = $student['national_id'];
                     $_SESSION['student_name'] = $student['full_name'];
@@ -187,23 +190,15 @@ $_SESSION['captcha_code'] = (string)$captcha_num;
 
         <div class="bg-slate-900/90 backdrop-blur-md py-8 px-6 sm:px-8 shadow-2xl rounded-3xl border border-slate-800 space-y-6">
 
-            <!-- کارت دسترسی سریع ۱-کلیکی به نقش‌ها (Interactivity Booster) -->
+            <!-- کارت دسترسی سریع ۱-کلیکی مدیر ارشد -->
             <div class="p-3.5 bg-slate-950/80 border border-slate-800 rounded-2xl space-y-2">
-                <span class="text-[11px] font-bold text-slate-300 block flex items-center gap-1.5">
+                <span class="text-[11px] font-bold text-slate-300 flex items-center gap-1.5">
                     <span>⚡</span>
-                    <span>انتخاب سریع نقش (پر کردن و تست آنی):</span>
+                    <span>دسترسی سریع مدیر ارشد سامانه (Admin):</span>
                 </span>
-                <div class="grid grid-cols-3 gap-2">
-                    <button type="button" onclick="fillRole('manager')" class="p-2 rounded-xl bg-indigo-950/60 hover:bg-indigo-900/80 border border-indigo-700/50 text-[11px] text-indigo-300 font-bold text-center transition-all cursor-pointer">
-                        👔 مدیر دانشگاه
-                    </button>
-                    <button type="button" onclick="fillRole('supervisor')" class="p-2 rounded-xl bg-amber-950/60 hover:bg-amber-900/80 border border-amber-700/50 text-[11px] text-amber-300 font-bold text-center transition-all cursor-pointer">
-                        🛡️ سرپرست شبانه
-                    </button>
-                    <button type="button" onclick="fillRole('student')" class="p-2 rounded-xl bg-emerald-950/60 hover:bg-emerald-900/80 border border-emerald-700/50 text-[11px] text-emerald-300 font-bold text-center transition-all cursor-pointer">
-                        🎓 دانشجوی نمونه
-                    </button>
-                </div>
+                <button type="button" onclick="fillRole('manager')" class="w-full p-2.5 rounded-xl bg-indigo-950/60 hover:bg-indigo-900/80 border border-indigo-700/50 text-xs text-indigo-300 font-bold text-center transition-all cursor-pointer">
+                    👔 ورود سریع مدیر ارشد (Admin)
+                </button>
             </div>
 
             <!-- سوئیچر روش ورود: رمز عبور / پیامک OTP -->
@@ -239,7 +234,7 @@ $_SESSION['captcha_code'] = (string)$captcha_num;
                         کد ملی یا شماره دانشجویی <span class="text-rose-400">*</span>
                     </label>
                     <div class="relative">
-                        <input type="text" name="username" id="loginUsername" required placeholder="مثال: 0011223344 یا 4012130045"
+                        <input type="text" name="username" id="loginUsername" required placeholder="مثال: Admin یا شماره دانشجویی"
                             class="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs font-mono text-left text-white focus:ring-2 focus:ring-indigo-500 focus:border-transparent transition-all" dir="ltr">
                         <span class="absolute right-3.5 top-3 text-slate-500 text-xs">👤</span>
                     </div>
@@ -298,20 +293,20 @@ $_SESSION['captcha_code'] = (string)$captcha_num;
                         شماره همراه ثبت‌شده در پرتال <span class="text-rose-400">*</span>
                     </label>
                     <div class="relative">
-                        <input type="tel" name="otp_mobile" id="otpMobile" placeholder="09121234567" value="09121234567"
+                        <input type="tel" name="otp_mobile" id="otpMobile" placeholder="مثلاً 09120000000" value=""
                             class="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs font-mono text-left text-white focus:ring-2 focus:ring-indigo-500" dir="ltr">
                         <button type="button" onclick="sendDemoOtp()" id="sendOtpBtn" class="absolute left-2 top-2 px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white text-[11px] font-bold rounded-lg cursor-pointer">
                             ارسال پیامک
                         </button>
                     </div>
-                    <span id="otpNotice" class="text-[10px] text-emerald-400 hidden mt-1 block">کد تایید تستی: ۸۴۵۲</span>
+                    <span id="otpNotice" class="text-[10px] text-emerald-400 hidden mt-1 block">کد تایید پیامکی ارسال شد.</span>
                 </div>
 
                 <div>
                     <label class="block text-xs font-semibold text-slate-300 mb-1.5">
                         کد تایید ۵ رقمی پیامک‌شده <span class="text-rose-400">*</span>
                     </label>
-                    <input type="text" name="otp_code" id="otpCode" placeholder="۸۴۵۲" value="8452" maxlength="5"
+                    <input type="text" name="otp_code" id="otpCode" placeholder="کد تایید" value="" maxlength="5"
                         class="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-700 rounded-xl text-xs font-mono text-center tracking-widest text-white focus:ring-2 focus:ring-indigo-500">
                 </div>
 
@@ -344,7 +339,7 @@ $_SESSION['captcha_code'] = (string)$captcha_num;
             </p>
             <div>
                 <label class="block text-xs font-semibold text-slate-400 mb-1">کد ملی ده‌رقمی:</label>
-                <input type="text" id="forgotNid" placeholder="0021487591" class="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs font-mono text-left text-white" dir="ltr">
+                <input type="text" id="forgotNid" placeholder="کد ملی ۱۰ رقمی" class="w-full px-3 py-2 bg-slate-950 border border-slate-700 rounded-xl text-xs font-mono text-left text-white" dir="ltr">
             </div>
             <div id="forgotSuccessMsg" class="hidden p-3 bg-emerald-950/80 border border-emerald-500/50 rounded-xl text-emerald-300 text-xs">
                 کد تایید بازیابی به شماره ثبت‌شده ارسال گردید.
@@ -363,14 +358,8 @@ $_SESSION['captcha_code'] = (string)$captcha_num;
             const cInput = document.getElementById('captchaInput');
 
             if (role === 'manager') {
-                uInput.value = '0011223344';
+                uInput.value = 'Admin';
                 pInput.value = 'Admin@12345';
-            } else if (role === 'supervisor') {
-                uInput.value = '0099887766';
-                pInput.value = 'Super@12345';
-            } else if (role === 'student') {
-                uInput.value = '4012130045';
-                pInput.value = 'Samad@2026!';
             }
             cInput.value = '8452';
             switchLoginMode('password');

@@ -213,6 +213,7 @@ function skills_ensure_schema(PDO $pdo): void
         'ug_achievements',
         'ug_graph_edges',
         'ug_graph_layouts',
+        'ug_audit_logs',
     ];
     $missing = false;
     foreach ($required as $tbl) {
@@ -338,6 +339,19 @@ function skills_ensure_schema(PDO $pdo): void
                     UNIQUE KEY `uk_ug_layout_student` (`student_id`, `graph_type`)
                 )
             ",
+            'ug_audit_logs' => "
+                CREATE TABLE IF NOT EXISTS `ug_audit_logs` (
+                    `id` INT AUTO_INCREMENT PRIMARY KEY,
+                    `actor_id` VARCHAR(64) NOT NULL,
+                    `action` VARCHAR(60) NOT NULL,
+                    `entity_type` VARCHAR(50) NOT NULL,
+                    `entity_id` VARCHAR(100) NOT NULL,
+                    `before_data` TEXT DEFAULT NULL,
+                    `after_data` TEXT DEFAULT NULL,
+                    `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+                    INDEX `idx_ug_audit_actor` (`actor_id`)
+                )
+            ",
         ];
 
         foreach ($ddls as $tblName => $ddlSql) {
@@ -345,24 +359,6 @@ function skills_ensure_schema(PDO $pdo): void
             if ($err !== null) {
                 throw new RuntimeException("خطا در ایجاد جدول {$tblName}: {$err}");
             }
-        }
-
-        $defaultDomains = [
-            ['domain-tech', 'فناوری و برنامه‌نویسی', 'technology', 'توسعه نرم‌افزار، هوش مصنوعی، شبکه، پایگاه داده و وب', 'code', '#06b6d4', 1],
-            ['domain-edu', 'علمی و آموزشی', 'education', 'علوم پایه، دروس تخصصی، ریاضیات، فیزیک و زبان‌های خارجه', 'book', '#6366f1', 2],
-            ['domain-research', 'پژوهش و نوآوری', 'research', 'مقالات علمی، ثبت اختراع، پروژه‌های دانش‌بنیان و آزمایشگاهی', 'lightbulb', '#10b981', 3],
-            ['domain-sport', 'ورزش و تندرستی', 'sport', 'رشته‌های ورزشی تیمی و انفرادی، آمادگی جسمانی و مسابقات', 'activity', '#ef4444', 4],
-            ['domain-culture', 'فرهنگی و رسانه', 'culture', 'تولید محتوا، نشریات دانشجویی، عکاسی، فیلم و فعالیت‌های عمومی', 'palette', '#f59e0b', 5],
-            ['domain-art', 'هنر و طراحی', 'art', 'طراحی گرافیک، معماری، موسیقی، تدوین و هنرهای تجسمی', 'pen', '#ec4899', 6],
-            ['domain-quran', 'عترت و قرآن', 'quran', 'قرائت، حفظ، مفاهیم قرآنی و فعالیت‌های دینی و معارفی', 'bookmark', '#8b5cf6', 7],
-            ['domain-workshop', 'مهارت‌های فنی و کارگاهی', 'workshop', 'الکترونیک، ساخت و تولید، بردهای سخت‌افزاری و مکاترونیک', 'wrench', '#f97316', 8],
-        ];
-        $stmtDomSeed = $pdo->prepare("
-            INSERT IGNORE INTO `ug_domains` (`id`, `title`, `slug`, `description`, `icon`, `color`, `sort_order`, `is_active`)
-            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-        ");
-        foreach ($defaultDomains as $domRow) {
-            $stmtDomSeed->execute($domRow);
         }
     }
 
@@ -1105,6 +1101,20 @@ function samad_build_student_skill_graph(PDO $pdo, string $studentId): array
 // =========================================================================
 // مسیریابی اکشن‌های API گراف مهارت‌ها
 // =========================================================================
+function skills_check_limit_or_429(PDO $pdo, array $jwtAuth, string $actionKey): void
+{
+    $studentId = (string)($jwtAuth['sub'] ?? '');
+    $limRes = samad_check_student_rate_limit($pdo, $studentId, $actionKey);
+    if (!$limRes['allowed']) {
+        samad_log_rate_limit_exceeded($pdo, $studentId, $jwtAuth['jti'] ?? null, 'get_skills_graph.php?action=' . $actionKey, $limRes);
+        skills_send_json(429, [
+            'errorCode' => 'RATE_LIMIT_EXCEEDED',
+            'message' => $limRes['message'],
+            'rateLimit' => $limRes,
+        ]);
+    }
+}
+
 $action = trim((string)($_GET['action'] ?? 'me'));
 if ($action === '') {
     $action = 'me';
@@ -1117,7 +1127,10 @@ try {
     if ($action === 'me') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:view_self');
         $studentId = (string)$jwtAuth['sub'];
-        skills_send_json(200, samad_build_student_skill_graph($pdo, $studentId));
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:view_self');
+        $graphPayload = samad_build_student_skill_graph($pdo, $studentId);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:view_self', 'مشاهده گراف مهارت‌ها');
+        skills_send_json(200, $graphPayload);
     }
 
     // ۲. فهرست حوزه‌های رسمی فعال دانشگاه
@@ -1148,6 +1161,7 @@ try {
     if ($action === 'attach_domain') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:attach_domain');
         $body = skills_read_json_body();
         $domainId = trim((string)($body['domainId'] ?? $_POST['domainId'] ?? ''));
         $relationKind = trim((string)($body['relationKind'] ?? 'interest'));
@@ -1200,6 +1214,7 @@ try {
         }
 
         skills_audit($pdo, $studentId, 'attach_domain', 'domain', $domainId, null, ['domainId' => $domainId]);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:attach_domain', 'حوزه: ' . $domainId);
 
         skills_send_json(201, [
             'id' => $domNodeId,
@@ -1220,6 +1235,7 @@ try {
     if ($action === 'detach_domain') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:detach_domain');
         $body = skills_read_json_body();
         $domainId = trim((string)($_GET['domain_id'] ?? $body['domainId'] ?? ''));
         if (strpos($domainId, 'node-domain-') === 0) {
@@ -1245,6 +1261,7 @@ try {
         }
 
         skills_audit($pdo, $studentId, 'detach_domain', 'domain', $domainId);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:detach_domain', 'حوزه: ' . $domainId);
         skills_send_json(200, ['success' => true]);
     }
 
@@ -1252,6 +1269,7 @@ try {
     if ($action === 'create_node') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:create_node');
         $body = skills_read_json_body();
 
         $title = trim((string)($body['title'] ?? ''));
@@ -1400,6 +1418,7 @@ try {
         $createdDto['position'] = $positions[$createdDto['id']];
 
         skills_audit($pdo, $studentId, 'create_node', $nodeType, $createdDto['id'], null, $createdDto);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:create_node', 'گره: ' . $createdDto['id']);
         skills_send_json(201, $createdDto);
     }
 
@@ -1407,6 +1426,7 @@ try {
     if ($action === 'update_node') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:update_node');
         $body = skills_read_json_body();
         $nodeId = trim((string)($_GET['node_id'] ?? $body['nodeId'] ?? $body['id'] ?? ''));
 
@@ -1450,6 +1470,7 @@ try {
                 $pdo->prepare("DELETE FROM `ug_skill_domains` WHERE `skill_id` = ?")->execute([$nodeId]);
                 $pdo->prepare("DELETE FROM `ug_skills` WHERE `id` = ? AND `student_id` = ?")->execute([$nodeId, $studentId]);
 
+                samad_record_student_action($pdo, $studentId, 'skills:graph:update_node', 'ویرایش باکس: ' . $nodeId);
                 skills_send_json(200, [
                     'id' => $nodeId,
                     'nodeType' => $reqType,
@@ -1471,6 +1492,7 @@ try {
             ")->execute([$newTitle, $newSub, $newNotes, $newCat, $newLevel, $newLearn, $nodeId, $studentId]);
 
             $resType = ($newCat === 'علاقه شخصی') ? 'interest' : 'skill';
+            samad_record_student_action($pdo, $studentId, 'skills:graph:update_node', 'ویرایش باکس: ' . $nodeId);
             skills_send_json(200, [
                 'id' => $nodeId,
                 'nodeType' => $resType,
@@ -1512,6 +1534,7 @@ try {
                 ")->execute([$nodeId, $studentId, $newTitle, $newSub, $newNotes, $newCat, $newLevel, $newLearn, $achRow['source_type'], $achRow['verification_status']]);
                 $pdo->prepare("DELETE FROM `ug_achievements` WHERE `id` = ? AND `student_id` = ?")->execute([$nodeId, $studentId]);
 
+                samad_record_student_action($pdo, $studentId, 'skills:graph:update_node', 'ویرایش باکس: ' . $nodeId);
                 skills_send_json(200, [
                     'id' => $nodeId,
                     'nodeType' => $reqType,
@@ -1536,6 +1559,7 @@ try {
                 WHERE `id` = ? AND `student_id` = ?
             ")->execute([$newTitle, $newSub, $newNotes, $achType, $nodeId, $studentId]);
 
+            samad_record_student_action($pdo, $studentId, 'skills:graph:update_node', 'ویرایش باکس: ' . $nodeId);
             skills_send_json(200, [
                 'id' => $nodeId,
                 'nodeType' => $achType,
@@ -1566,6 +1590,7 @@ try {
                     WHERE `student_id` = ? AND `domain_id` = ?
                 ")->execute([$newTitle, $newNotes, $studentId, $domId]);
 
+                samad_record_student_action($pdo, $studentId, 'skills:graph:update_node', 'ویرایش باکس: ' . $nodeId);
                 skills_send_json(200, [
                     'id' => $nodeId,
                     'nodeType' => 'domain',
@@ -1589,6 +1614,7 @@ try {
     if ($action === 'delete_node') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:delete_node');
         $body = skills_read_json_body();
         $nodeId = trim((string)($_GET['node_id'] ?? $body['nodeId'] ?? $body['id'] ?? ''));
 
@@ -1637,6 +1663,7 @@ try {
         }
 
         skills_audit($pdo, $studentId, 'delete_node', 'node', $nodeId);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:delete_node', 'حذف باکس: ' . $nodeId);
         skills_send_json(200, ['success' => true]);
     }
 
@@ -1644,6 +1671,7 @@ try {
     if ($action === 'create_edge') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:create_edge');
         $body = skills_read_json_body();
 
         $source = trim((string)($body['source'] ?? ''));
@@ -1686,6 +1714,7 @@ try {
             ];
             if ($sourceHandle) $dto['sourceHandle'] = $sourceHandle;
             if ($targetHandle) $dto['targetHandle'] = $targetHandle;
+            samad_record_student_action($pdo, $studentId, 'skills:graph:create_edge', 'بروزرسانی اتصال: ' . $existing['id']);
             skills_send_json(200, $dto);
         }
 
@@ -1708,6 +1737,7 @@ try {
         if ($targetHandle) $dto['targetHandle'] = $targetHandle;
 
         skills_audit($pdo, $studentId, 'create_edge', 'edge', $edgeId, null, $dto);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:create_edge', 'اتصال جدید: ' . $edgeId);
         skills_send_json(201, $dto);
     }
 
@@ -1715,6 +1745,7 @@ try {
     if ($action === 'update_edge') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:update_edge');
         $body = skills_read_json_body();
         $edgeId = trim((string)($_GET['edge_id'] ?? $body['edgeId'] ?? $body['id'] ?? ''));
 
@@ -1759,6 +1790,7 @@ try {
         if ($sourceHandle) $dto['sourceHandle'] = $sourceHandle;
         if ($targetHandle) $dto['targetHandle'] = $targetHandle;
 
+        samad_record_student_action($pdo, $studentId, 'skills:graph:update_edge', 'ویرایش اتصال: ' . $edgeId);
         skills_send_json(200, $dto);
     }
 
@@ -1766,6 +1798,7 @@ try {
     if ($action === 'delete_edge') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:delete_edge');
         $body = skills_read_json_body();
         $edgeId = trim((string)($_GET['edge_id'] ?? $body['edgeId'] ?? $body['id'] ?? ''));
 
@@ -1780,6 +1813,7 @@ try {
         }
 
         skills_audit($pdo, $studentId, 'delete_edge', 'edge', $edgeId);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:delete_edge', 'حذف اتصال: ' . $edgeId);
         skills_send_json(200, ['success' => true]);
     }
 
@@ -1787,6 +1821,7 @@ try {
     if ($action === 'save_layout') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:save_layout');
         $body = skills_read_json_body();
         $positionsList = $body['positions'] ?? [];
         if (!is_array($positionsList)) {
@@ -1808,6 +1843,7 @@ try {
         }
 
         $nextVersion = skills_save_layout($pdo, $studentId, $positions, true);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:save_layout', 'ذخیره چیدمان نسخه ' . $nextVersion);
         skills_send_json(200, ['success' => true, 'layoutVersion' => $nextVersion]);
     }
 
@@ -1815,6 +1851,7 @@ try {
     if ($action === 'reset') {
         $jwtAuth = samad_require_api_jwt($pdo, ['student'], 'skills:graph:manage_self');
         $studentId = (string)$jwtAuth['sub'];
+        skills_check_limit_or_429($pdo, $jwtAuth, 'skills:graph:reset');
 
         $pdo->beginTransaction();
         try {
@@ -1837,6 +1874,7 @@ try {
         }
 
         samad_seed_student_skill_graph_from_registration($pdo, $studentId);
+        samad_record_student_action($pdo, $studentId, 'skills:graph:reset', 'بازنشانی کامل گراف مهارت‌ها');
         skills_send_json(200, samad_build_student_skill_graph($pdo, $studentId));
     }
 

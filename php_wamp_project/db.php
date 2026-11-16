@@ -39,6 +39,119 @@ try {
 // تک‌تک جداول در بلاک‌های مجزا ایجاد می‌شوند تا خطای یکی مانع بقیه نشود.
 // =========================================================================
 
+// ۲-۱. جدول منبع پذیرفته‌شدگان (admitted_students)
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `admitted_students` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `national_id` VARCHAR(10) NOT NULL UNIQUE COMMENT 'کد ملی ده رقمی دانشجو',
+            `student_id` VARCHAR(20) NOT NULL UNIQUE COMMENT 'شماره دانشجویی اختصاصی',
+            `full_name` VARCHAR(150) NOT NULL COMMENT 'نام و نام خانوادگی در پرونده سنجش',
+            `campus` ENUM('پردیس فناوری', 'پردیس مهارت') NOT NULL COMMENT 'پردیس قبولی',
+            `field_of_study` VARCHAR(150) NOT NULL COMMENT 'رشته قبولی',
+            `is_registered` TINYINT(1) DEFAULT 0 COMMENT 'آیا قبلاً ثبت نام کرده است؟',
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+    ");
+} catch (Exception $ex) {}
+
+// ۲-۲. جدول اصلی دانشجویان ثبت‌نام شده (students)
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `students` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `national_id` VARCHAR(10) NOT NULL UNIQUE,
+            `student_id` VARCHAR(20) NOT NULL UNIQUE,
+            `full_name` VARCHAR(150) NOT NULL,
+            `mobile` VARCHAR(15) NOT NULL,
+            `campus` ENUM('پردیس فناوری', 'پردیس مهارت') NOT NULL,
+            `field_of_study` VARCHAR(150) NOT NULL,
+            `study_shift` ENUM('روزانه', 'شبانه (نوبت دوم)') NOT NULL,
+            `province` VARCHAR(80) NOT NULL,
+            `city` VARCHAR(80) NOT NULL,
+            `is_foreign_student` TINYINT(1) DEFAULT 0,
+            `foreign_student_code` VARCHAR(50) DEFAULT NULL,
+            `residential_address` TEXT NOT NULL,
+            `request_dormitory` TINYINT(1) DEFAULT 0,
+            `dormitory_note` TEXT DEFAULT NULL,
+            `photo_path` VARCHAR(255) DEFAULT NULL,
+            `password_hash` VARCHAR(255) NOT NULL,
+            `wallet_balance` BIGINT NOT NULL DEFAULT 250000 COMMENT 'موجودی کیف پول الکترونیک به ریال',
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX `idx_national_id` (`national_id`),
+            INDEX `idx_student_id` (`student_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+    ");
+} catch (Exception $ex) {}
+
+// ۲-۳. جدول کاربران ادمین (مدیر دانشگاه و سرپرست خوابگاه) (admins)
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `admins` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `national_id` VARCHAR(30) NOT NULL UNIQUE COMMENT 'شناسه یا کد ملی ادمین جهت ورود',
+            `password_hash` VARCHAR(255) NOT NULL COMMENT 'کلمه عبور هش شده یا مستقیم',
+            `full_name` VARCHAR(150) NOT NULL COMMENT 'نام و سمت',
+            `role` ENUM('manager', 'supervisor') NOT NULL COMMENT 'manager: مدیر دانشگاه | supervisor: سرپرست خوابگاه',
+            `created_by_national_id` VARCHAR(30) DEFAULT NULL COMMENT 'شناسه مدیر ایجادکننده کاربر',
+            `shift_hours` VARCHAR(150) DEFAULT '۲۲:۰۰ الی ۰۶:۰۰ (شیفت شب)',
+            `shift_days` VARCHAR(150) DEFAULT 'شنبه تا چهارشنبه',
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+    ");
+
+    try {
+        $pdo->exec("ALTER TABLE `admins` MODIFY COLUMN `national_id` VARCHAR(30) NOT NULL");
+    } catch (Exception $eCol) {}
+
+    $chkAdmins = $pdo->query("SELECT COUNT(*) FROM `admins`")->fetchColumn();
+    if ($chkAdmins == 0) {
+        $stmtAdminSeed = $pdo->prepare("
+            INSERT IGNORE INTO `admins` (`national_id`, `password_hash`, `full_name`, `role`)
+            VALUES (?, ?, ?, ?)
+        ");
+        $stmtAdminSeed->execute(['Admin', password_hash('Admin@12345', PASSWORD_BCRYPT), 'مدیر ارشد سامانه (Admin)', 'manager']);
+    }
+} catch (Exception $ex) {}
+
+// ۲-۴. جدول اتاق‌های خوابگاه (dorm_rooms)
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `dorm_rooms` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `room_number` VARCHAR(10) NOT NULL UNIQUE COMMENT 'شماره اتاق (مانند G01، 100، 101، 201)',
+            `floor` ENUM('همکف', 'طبقه اول', 'طبقه دوم') NOT NULL COMMENT 'طبقه استقرار اتاق',
+            `capacity` INT NOT NULL DEFAULT 4 COMMENT 'ظرفیت کل اتاق (تعداد تخت)',
+            `is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT '1: فعال و دایر | 0: غیرفعال و در دست تعمیر',
+            `is_completed` TINYINT(1) NOT NULL DEFAULT 0 COMMENT '0: در انتظار تکمیل امکانات | 1: تکمیل‌شده',
+            `description` VARCHAR(255) DEFAULT NULL COMMENT 'توضیحات (دارای بالکن، نزدیک راهرو و ...)',
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+    ");
+} catch (Exception $ex) {}
+
+// ۲-۵. جدول تخصیص اتاق به دانشجویان (dorm_allocations)
+try {
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS `dorm_allocations` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `student_id` VARCHAR(20) NOT NULL COMMENT 'شماره دانشجویی',
+            `room_id` INT NOT NULL COMMENT 'اتاق تخصیص یافته',
+            `dorm_status` ENUM('میهمان', 'دارای شهریه', 'بدون شهریه') NOT NULL DEFAULT 'بدون شهریه' COMMENT 'وضعیت اسکان دانشجو',
+            `allocation_date` DATE NOT NULL COMMENT 'تاریخ اسکان',
+            `is_active` TINYINT(1) NOT NULL DEFAULT 1 COMMENT 'وضعیت سکونت جاری',
+            `guest_days_total` INT DEFAULT NULL COMMENT 'تعداد کل روزهای مجاز اقامت میهمانی',
+            `guest_days_remaining` INT DEFAULT NULL COMMENT 'تعداد روزهای باقی‌مانده از اقامت میهمانی',
+            `guest_start_date` DATE DEFAULT NULL COMMENT 'تاریخ شروع اقامت میهمان',
+            `guest_end_date` DATE DEFAULT NULL COMMENT 'تاریخ پایان اقامت میهمان',
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX `idx_alloc_room` (`room_id`),
+            INDEX `idx_alloc_student` (`student_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
+    ");
+} catch (Exception $ex) {}
+
 // جدول تیم‌های ورزشی دانشجو (student_sports_teams)
 try {
     $pdo->exec("
@@ -50,16 +163,6 @@ try {
             INDEX `idx_student_sports` (`student_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
     ");
-
-    // درج نمونه اولیه در صورت خالی بودن
-    $chkTeams = $pdo->query("SELECT COUNT(*) FROM `student_sports_teams`")->fetchColumn();
-    if ($chkTeams == 0) {
-        $pdo->exec("
-            INSERT IGNORE INTO `student_sports_teams` (`student_id`, `team_name`) VALUES
-            ('4012130045', 'تیم فوتبال دانشگاه'),
-            ('4012130045', 'والیبال');
-        ");
-    }
 } catch (Exception $ex) {}
 
 // جدول فراخوان‌های هدفمند جشنواره‌ها (festival_calls)
@@ -76,15 +179,6 @@ try {
             `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
     ");
-
-    $chkCalls = $pdo->query("SELECT COUNT(*) FROM `festival_calls`")->fetchColumn();
-    if ($chkCalls == 0) {
-        $pdo->exec("
-            INSERT IGNORE INTO `festival_calls` (`title`, `target_category`, `target_sports_team`, `content`, `deadline_date`, `issued_by`) VALUES
-            ('فراخوان عضویت و انتخابی تیم فوتبال دانشجویان در مسابقات منطقه ای', 'sports', 'تیم فوتبال دانشگاه', 'از کلیه دانشجویان عضو تیم فوتبال و علاقه‌مندان جهت شرکت در تمرینات انتخابی مسابقات منطقه‌ای دانشگاه ملی مهارت دعوت به عمل می‌آید.', '۱۴۰۳/۰۸/۰۵', 'دکتر علیرضا حسینی (مدیر تربیت بدنی)'),
-            ('فراخوان دومین المپیاد ملی مهارت‌آموزی و رباتیک دانشجویی', 'robotics', NULL, 'ثبت‌نام متقاضیان رقابت‌های ملی ساخت ربات‌های صنعتی و هوش مصنوعی آغاز شد. جهت هماهنگی با کارشناس پردیس مراجعه فرمایید.', '۱۴۰۳/۰۸/۱۵', 'معاونت پژوهش و فناوری پردیس');
-        ");
-    }
 } catch (Exception $ex) {}
 
 // جدول امکانات و تجهیزات اتاق‌ها (room_facilities)
@@ -118,19 +212,27 @@ try {
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
     ");
 
-    $chkFac = $pdo->query("SELECT COUNT(*) FROM `room_facilities`")->fetchColumn();
-    if ($chkFac == 0) {
-        $pdo->exec("
-            INSERT IGNORE INTO `room_facilities` (`room_id`, `room_number`, `floor`, `refrigerator`, `fridge_model`, `wardrobe`, `carpet`, `bed_type`, `ac_heater`, `has_broom`, `has_trash_bin`, `has_bucket`, `has_carpet`, `has_wardrobe`, `status`) VALUES
-            (1, 'G01', 'همکف', 'یخچال ۶ فوت امرسان', 'یخچال ۶ فوت امرسان', 'کمد ۴ درب چوبی', 'فرش ۶ متری ۱۲۰۰ شانه', 'تخت فلزی دو طبقه', 'شوفاژ + کولر', 1, 1, 1, 1, 1, 'تکمیل‌شده'),
-            (2, 'G02', 'همکف', 'یخچال ۵ فوت ایستکول', 'یخچال ۵ فوت ایستکول', 'کمد ۴ درب فلزی', 'فرش ۶ متری ۷۰۰ شانه', 'تخت فلزی دو طبقه', 'شوفاژ + کولر', 1, 1, 1, 1, 1, 'تکمیل‌شده'),
-            (4, '100', 'طبقه اول', 'یخچال دوقلو ۱۲ فوت بزرگ', 'یخچال دوقلو ۱۲ فوت امرسان', 'کمد ۱۰ درب تفکیکی جادار', '۲ تخته فرش ۹ متری کاشان', 'تخت‌های استاندارد ۱۰ نفره', 'اسپلیت ۲۴ هزار ال‌جی', 1, 1, 1, 1, 1, 'تکمیل‌شده'),
-            (5, '101', 'طبقه اول', 'یخچال ۷ فوت اسنوا', 'یخچال ۷ فوت اسنوا', 'کمد ۴ درب اختصاصی', 'فرش ۶ متری طرح افشان', 'تخت فلزی دو طبقه', 'شوفاژ + کولر', 1, 1, 1, 1, 1, 'تکمیل‌شده'),
-            (6, '102', 'طبقه اول', 'یخچال ۵ فوت فیلور', 'یخچال ۵ فوت فیلور', 'کمد ۴ درب چوبی', 'فرش ۶ متری مشهد', 'تخت فلزی دو طبقه', 'شوفاژ + کولر', 1, 1, 1, 1, 1, 'تکمیل‌شده'),
-            (7, '103', 'طبقه اول', 'یخچال ۹ فوت دونار', 'یخچال ۹ فوت دونار', 'کمد ۶ درب ام‌دی‌اف نخبگان', 'فرش ۹ متری تبریز', 'تخت فلزی دو طبقه', 'شوفاژ + اسپلیت', 1, 1, 1, 1, 1, 'تکمیل‌شده'),
-            (9, '201', 'طبقه دوم', 'یخچال ۶ فوت امرسان', 'یخچال ۶ فوت امرسان', 'کمد ۴ درب', 'فرش ۶ متری', 'تخت فلزی دو طبقه', 'شوفاژ + کولر', 1, 1, 1, 1, 1, 'تکمیل‌شده'),
-            (10, '202', 'طبقه دوم', 'یخچال ۶ فوت هیمالیا', 'یخچال ۶ فوت هیمالیا', 'کمد ۴ درب', 'فرش ۶ متری', 'تخت فلزی دو طبقه', 'شوفاژ + کولر', 1, 1, 1, 1, 1, 'تکمیل‌شده');
-        ");
+    // افزودن ستون‌های تفکیکی امکانات اتاق در صورت ایمپورت نسخه قدیمی‌تر database.sql
+    $existingFacCols = $pdo->query("SHOW COLUMNS FROM `room_facilities`")->fetchAll(PDO::FETCH_COLUMN);
+    $facColumnDefs = [
+        'fridge_model'  => "VARCHAR(100) DEFAULT 'یخچال ۶ فوت امرسان' AFTER `refrigerator`",
+        'bed_type'      => "VARCHAR(100) DEFAULT 'تخت فلزی دو طبقه استاندارد' AFTER `carpet`",
+        'ac_heater'     => "VARCHAR(100) DEFAULT 'شوفاژ مرکزی + کولر آبی' AFTER `bed_type`",
+        'tv_model'      => "VARCHAR(100) DEFAULT NULL AFTER `ac_heater`",
+        'has_broom'     => "TINYINT(1) DEFAULT 1 AFTER `tv_model`",
+        'has_trash_bin' => "TINYINT(1) DEFAULT 1 AFTER `has_broom`",
+        'has_bucket'    => "TINYINT(1) DEFAULT 1 AFTER `has_trash_bin`",
+        'has_carpet'    => "TINYINT(1) DEFAULT 1 AFTER `has_bucket`",
+        'has_wardrobe'  => "TINYINT(1) DEFAULT 1 AFTER `has_carpet`",
+        'has_desk'      => "TINYINT(1) DEFAULT 0 AFTER `has_wardrobe`",
+        'has_shoe_rack' => "TINYINT(1) DEFAULT 1 AFTER `has_desk`",
+        'has_mirror'    => "TINYINT(1) DEFAULT 1 AFTER `has_shoe_rack`",
+        'notes'         => "TEXT DEFAULT NULL AFTER `secondary_facilities`",
+    ];
+    foreach ($facColumnDefs as $colName => $colDef) {
+        if (!in_array($colName, $existingFacCols, true)) {
+            $pdo->exec("ALTER TABLE `room_facilities` ADD COLUMN `{$colName}` {$colDef}");
+        }
     }
 } catch (Exception $ex) {}
 
@@ -152,20 +254,6 @@ try {
             INDEX `idx_clean_room` (`room_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
     ");
-
-    $chkClean = $pdo->query("SELECT COUNT(*) FROM `room_cleanliness_records`")->fetchColumn();
-    if ($chkClean == 0) {
-        $pdo->exec("
-            INSERT IGNORE INTO `room_cleanliness_records` (`room_id`, `room_number`, `floor`, `inspection_date`, `grade`, `supervisor_national_id`, `supervisor_name`, `notes`, `recorded_at`) VALUES
-            (4, '100', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'عالی', '0099887766', 'مهندس کامران قنبری', 'نظافت استثنایی اتاق ۱۰ نفره، کف بسیار تمیز و مرتب، تهویه عالی', '۱۴۰۳/۰۷/۱۴ - ۲۳:۳۰'),
-            (5, '101', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'عالی', '0099887766', 'مهندس کامران قنبری', 'تخت‌های مرتب و آنکادر، یخچال بسیار پاکیزه', '۱۴۰۳/۰۷/۱۴ - ۲۳:۳۵'),
-            (6, '102', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'خوب', '0099887766', 'مهندس کامران قنبری', 'مرتب و منظم، میز مطالعه کمی شلوغ', '۱۴۰۳/۰۷/۱۴ - ۲۳:۴۰'),
-            (7, '103', 'طبقه اول', '۱۴۰۳/۰۷/۱۴', 'عالی', '0099887766', 'مهندس کامران قنبری', 'اتاق نخبگان بسیار منضبط و پاکیزه', '۱۴۰۳/۰۷/۱۴ - ۲۳:۴۵'),
-            (9, '201', 'طبقه دوم', '۱۴۰۳/۰۷/۱۴', 'متوسط', '0099887766', 'مهندس کامران قنبری', 'نیاز به شستشوی ظروف سینک و جمع‌آوری لباس‌ها', '۱۴۰۳/۰۷/۱۴ - ۲۳:۵۰'),
-            (10, '202', 'طبقه دوم', '۱۴۰۳/۰۷/۱۴', 'ضعیف', '0099887766', 'مهندس کامران قنبری', 'انباشت زباله در سطل، تذکر کتبی به ساکنین اتاق داده شد', '۱۴۰۳/۰۷/۱۴ - ۲۳:۵۵'),
-            (1, 'G01', 'همکف', '۱۴۰۳/۰۷/۱۴', 'خوب', '0099887766', 'مهندس کامران قنبری', 'کف تی کشیده شده و اتاق آماده است', '۱۴۰۳/۰۷/۱۵ - ۰۰:۰۰');
-        ");
-    }
 } catch (Exception $ex) {}
 
 // جدول کارتابل خرابی و تعمیرات (maintenance_reports)
@@ -195,35 +283,6 @@ try {
             `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX `idx_maint_room` (`room_id`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
-    ");
-
-    $chkMaint = $pdo->query("SELECT COUNT(*) FROM `maintenance_reports`")->fetchColumn();
-    if ($chkMaint == 0) {
-        $pdo->exec("
-            INSERT IGNORE INTO `maintenance_reports` (`room_id`, `room_number`, `floor`, `equipment_name`, `maintenance_type`, `urgency`, `status`, `description`, `reported_by_supervisor_id`, `reported_by_supervisor_name`, `reported_at`, `resolved_at`, `resolved_by_manager_name`, `resolution_action`, `resolution_cost`, `cost_rials`, `invoice_number`, `contractor_or_store_name`, `resolution_notes`) VALUES
-            (4, '100', 'طبقه اول', 'تخت طبقه دوم شماره ۳', 'تعمیر', 'فوری', 'در انتظار اقدام', 'جوش پایه نردبان تخت فلزی شل شده و برای بالا رفتن دانشجو خطرآفرین است.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۱۵ - ۲۲:۱۵', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-            (5, '101', 'طبقه اول', 'دستگیره پنجره بالکن', 'تعمیر', 'عادی', 'در انتظار اقدام', 'دستگیره دوجداره لق شده و به درستی قفل نمی‌شود.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۱۴ - ۲۲:۳۰', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-            (9, '201', 'طبقه دوم', 'رادیاتور شوفاژ اتاق', 'تعمیر', 'فوری', 'در حال تعمیر', 'نشتی جزئی آب از شیر رفت شوفاژ؛ نیازمند آچارکشی و تعویض واشر.', 'SUP-405-02', 'حسین مرادی', '۱۴۰۳/۰۷/۱۴ - ۲۲:۴۵', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL),
-            (1, 'G01', 'همکف', 'ترموستات یخچال امرسان', 'تعمیر', 'عادی', 'رفع‌شده / تعمیر شد', 'موتور یخچال یکسره کار می‌کرد و دمای داخل بیش از حد سرد بود.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۱۰ - ۲۱:۰۰', '۱۴۰۳/۰۷/۱۱ - ۱۰:۳۰', 'دکتر علیرضا حسینی (مدیر امور رفاهی)', 'تعمیر قطعه', 3500000, 3500000, 'INV-1403-1001', 'تعمیرگاه مجاز لوازم خانگی پردیس', 'سرویسکار مجاز فراخوانده شد و رله استارت و ترموستات تنظیم و تعویض گردید.'),
-            (6, '102', 'طبقه اول', 'قفل درب کمد دیواری', 'تعمیر', 'عادی', 'رفع‌شده / تعمیر شد', 'مغزی قفل کمد گیر کرده بود و کلید نمی‌چرخید.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۰۸ - ۲۳:۰۰', '۱۴۰۳/۰۷/۰۹ - ۱۱:۰۰', 'دکتر علیرضا حسینی (مدیر امور رفاهی)', 'تعمیر قطعه', 1800000, 1800000, 'INV-1403-1002', 'ابزار و یراق پردیس مرکزی', 'مغزی قفل کمد تعویض و کلید جدید به سرپرست تحویل شد.'),
-            (7, '103', 'طبقه اول', 'مهتابی ال‌ای‌دی سقف', 'تعویض / خرید جدید', 'عادی', 'رفع‌شده / خریداری و تعویض شد', 'ترانس لامپ مهتابی سوخته بود و روشنایی کافی نداشت.', 'SUP-405-01', 'مهندس کامران قنبری', '۱۴۰۳/۰۷/۰۵ - ۲۲:۰۰', '۱۴۰۳/۰۷/۰۶ - ۰۹:۳۰', 'دکتر علیرضا حسینی (مدیر امور رفاهی)', 'خرید و جایگزینی تجهیز نو', 2400000, 2400000, 'INV-1403-1003', 'کالای برق و روشنایی نوین', 'پنل ال‌ای‌دی ۶۰ در ۶۰ پرنور نو نصب و جایگزین گردید.');
-        ");
-    }
-
-    // تضمین وجود متقاضیان پذیرفته‌شده و دانشجویان در انتظار اسکان
-    $pdo->exec("
-        INSERT IGNORE INTO `admitted_students` (`national_id`, `student_id`, `full_name`, `campus`, `field_of_study`, `is_registered`) VALUES
-        ('0055443322', '4012130070', 'سینا محمدپور (داوطلب قبولی جدید)', 'پردیس فناوری', 'مهندسی کامپیوتر - شبکه', 0),
-        ('0066554433', '4012130071', 'مریم شفیعی (داوطلب قبولی جدید)', 'پردیس مهارت', 'طراحی لباس و پارچه', 0),
-        ('0077665544', '4012130072', 'پرهام رفیعی (داوطلب قبولی جدید)', 'پردیس فناوری', 'مکاترونیک و اتوماسیون صنعتی', 0);
-    ");
-
-    $defaultHash = '$2y$10$tHvhI5v0lTqVqXfXj4mYlOq5bV5H/Z3L9dG1A/q5Z6aK2Y2E7sP/6';
-    $pdo->exec("
-        INSERT IGNORE INTO `students` (`national_id`, `student_id`, `full_name`, `mobile`, `campus`, `field_of_study`, `study_shift`, `province`, `city`, `residential_address`, `request_dormitory`, `password_hash`) VALUES
-        ('0091234561', '4012130081', 'امیررضا کریمی (در انتظار اسکان)', '09351112233', 'پردیس فناوری', 'مهندسی کامپیوتر', 'روزانه', 'آذربایجان شرقی', 'تبریز', 'تبریز، میدان آبرسان', 1, '{$defaultHash}'),
-        ('0091234562', '4012130082', 'محمدحسین نوری (متقاضی میهمانی)', '09362223344', 'پردیس مهارت', 'گرافیک و انیمیشن', 'روزانه', 'اصفهان', 'کاشان', 'کاشان، خیابان امیرکبیر', 1, '{$defaultHash}'),
-        ('0091234563', '4012130083', 'سجاد موسوی (در انتظار اسکان)', '09373334455', 'پردیس فناوری', 'مهندسی برق صنعتی', 'شبانه (نوبت دوم)', 'خوزستان', 'دزفول', 'دزفول، خیابان شریعتی', 1, '{$defaultHash}');
     ");
 } catch (Exception $ex) {}
 
@@ -326,22 +385,26 @@ try {
     }
 } catch (Exception $ex) {}
 
-// ستون‌های شماره فاکتور و پیمانکار در maintenance_reports
+// ستون‌های شماره فاکتور، مبلغ ریالی و پیمانکار در maintenance_reports
 try {
-    $checkMaintInv = $pdo->query("SHOW COLUMNS FROM `maintenance_reports` LIKE 'invoice_number'")->fetchAll();
-    if (empty($checkMaintInv)) {
-        $pdo->exec("
-            ALTER TABLE `maintenance_reports` 
-            ADD COLUMN `invoice_number` VARCHAR(50) DEFAULT NULL,
-            ADD COLUMN `contractor_or_store_name` VARCHAR(150) DEFAULT NULL,
-            ADD COLUMN `cost_rials` BIGINT DEFAULT NULL,
-            ADD COLUMN `resolution_cost` BIGINT DEFAULT NULL,
-            ADD COLUMN `resolution_action` VARCHAR(100) DEFAULT NULL,
-            ADD COLUMN `resolution_notes` TEXT DEFAULT NULL,
-            ADD COLUMN `resolved_by_manager_name` VARCHAR(150) DEFAULT NULL
-        ");
+    $existingMaintCols = $pdo->query("SHOW COLUMNS FROM `maintenance_reports`")->fetchAll(PDO::FETCH_COLUMN);
+    $maintColumnDefs = [
+        'invoice_number'           => "VARCHAR(50) DEFAULT NULL",
+        'contractor_or_store_name' => "VARCHAR(150) DEFAULT NULL",
+        'cost_rials'               => "BIGINT DEFAULT NULL",
+        'resolution_cost'          => "BIGINT DEFAULT NULL",
+        'resolution_action'        => "VARCHAR(100) DEFAULT NULL",
+        'resolution_notes'         => "TEXT DEFAULT NULL",
+        'resolved_by_manager_name' => "VARCHAR(150) DEFAULT NULL",
+    ];
+    foreach ($maintColumnDefs as $colName => $colDef) {
+        if (!in_array($colName, $existingMaintCols, true)) {
+            $pdo->exec("ALTER TABLE `maintenance_reports` ADD COLUMN `{$colName}` {$colDef}");
+        }
     }
-    // تصحیح نوع داده status جهت پذیرش انواع وضعیت‌های فارسی
+    // تصحیح نوع داده‌ها جهت پذیرش انواع مقادیر مالی بزرگ و وضعیت‌های فارسی
+    $pdo->exec("ALTER TABLE `maintenance_reports` MODIFY COLUMN `resolution_cost` BIGINT DEFAULT NULL");
+    $pdo->exec("ALTER TABLE `maintenance_reports` MODIFY COLUMN `resolution_action` VARCHAR(100) DEFAULT NULL");
     $pdo->exec("ALTER TABLE `maintenance_reports` MODIFY COLUMN `status` VARCHAR(100) NOT NULL DEFAULT 'در انتظار اقدام'");
 } catch (Exception $ex) {}
 
@@ -355,7 +418,7 @@ try {
         WHERE `dorm_status` = 'میهمان' 
           AND `is_active` = 1 
           AND (
-              (`guest_end_date` IS NOT NULL AND `guest_end_date` != '' AND `guest_end_date` <= '{$todayStr}')
+              (`guest_end_date` IS NOT NULL AND `guest_end_date` <= '{$todayStr}')
               OR (`guest_days_remaining` IS NOT NULL AND `guest_days_remaining` <= 0)
           )
     ");
@@ -396,16 +459,6 @@ try {
             `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_persian_ci;
     ");
-
-    $chkServ = $pdo->query("SELECT COUNT(*) FROM `welfare_services`")->fetchColumn();
-    if ($chkServ == 0) {
-        $pdo->exec("
-            INSERT INTO `welfare_services` 
-                (`title`, `category`, `location`, `hourly_rate_rials`, `slot_duration_hours`, `capacity_per_slot`, `rules_guidelines`, `is_active`)
-            VALUES 
-                ('سالن بدنسازی و پرورش اندام پردیس', 'gym', 'زیرزمین خوابگاه مرکزی صمد - سالن شماره ۱', 50000, 2, 20, 'همراه داشتن کفش ورزشی تمیز مخصوص سالن، حوله شخصی و بطری آب الزامی است. ورود با لباس غیرورزشی ممنوع می‌باشد.', 1)
-        ");
-    }
 } catch (Exception $ex) {}
 
 // ۲. جدول سانس‌ها و برنامه‌ریزی هفتگی/روزانه (welfare_service_slots)
@@ -526,24 +579,39 @@ try {
 
     $defaultPerms = [
         // دانشجو
-        ['student', 'dorm:room:view_self', 'مشاهده پرونده اسکان و کارت شناسایی خود', 1],
+        ['student', 'dorm:card:view_self', 'مشاهده و چاپ کارت هوشمند دانشجویی', 1],
+        ['student', 'dorm:room:view_self', 'مشاهده پرونده اسکان، هم‌اتاقی‌ها و گواهی سکونت', 1],
         ['student', 'dorm:graph:view_self', 'مشاهده گراف تعاملی اتاق و هم‌اتاقی‌ها', 1],
+        ['student', 'dorm:guest_request:submit', 'ثبت و پیگیری درخواست اقامت میهمان در خوابگاه', 1],
+        ['student', 'student:festivals:view', 'مشاهده تب مهارت‌ها، تیم‌های ورزشی و فراخوان‌ها', 1],
         ['student', 'skills:graph:view_self', 'مشاهده نقشه تعاملی مهارت‌ها و علایق دانشجو', 1],
         ['student', 'skills:graph:manage_self', 'افزودن، ویرایش و چیدمان مهارت‌ها در گراف شخصی', 1],
-        ['student', 'welfare:book', 'رزرو سانس سالن بدنسازی و مدیریت کیف پول', 1],
+        ['student', 'welfare:book', 'مشاهده خدمات رفاهی، شارژ کیف پول و رزرو سالن بدنسازی', 1],
         ['student', 'student:profile:edit', 'ویرایش شماره تماس و کلمه عبور دانشجویی', 1],
         // سرپرست شبانه
         ['supervisor', 'dorm:attendance:manage', 'ثبت و مدیریت سرشماری شبانه دانشجویان', 1],
         ['supervisor', 'dorm:cleanliness:manage', 'ارزیابی شب به شب کیفیت نظافت اتاق‌ها', 1],
         ['supervisor', 'dorm:maintenance:report', 'ثبت گزارش خرابی و درخواست تعمیر تجهیزات', 1],
         ['supervisor', 'dorm:facilities:view', 'مشاهده شناسنامه امکانات اتاق‌ها', 1],
+        ['supervisor', 'dorm:guest_request:view', 'مشاهده درخواست‌های اقامت میهمان دانشجویان (فقط خواندنی)', 1],
         // مدیر دانشگاه
-        ['manager', 'dorm:graph:view_all', 'مشاهده گراف جامع کل ساختمان، طبقات و ساکنان', 1],
+        ['manager', 'dorm:overview:view', 'پیشخوان، آمار کلی و وضعیت طبقات', 1],
+        ['manager', 'dorm:admitted:manage', 'پذیرش دانشجوی جدید در جدول منبع', 1],
+        ['manager', 'dorm:unhoused:manage', 'مدیریت متقاضیان خوابگاه در صف اسکان', 1],
+        ['manager', 'dorm:student:purge', 'حذف کلی دانشجوی متقاضی خوابگاه از تمامی جداول و سامانه', 1],
+        ['manager', 'dorm:guest_request:manage', 'بررسی، تایید یا رد درخواست‌های اقامت میهمان دانشجویان', 1],
         ['manager', 'dorm:rooms:manage', 'مدیریت اتاق‌ها، طبقات و ظرفیت خوابگاه', 1],
-        ['manager', 'dorm:allocations:manage', 'اسکان دانشجویان، تغییر اتاق و میهمانی', 1],
-        ['manager', 'dorm:attendance:manage', 'نظارت و چاپ گزارش‌های سرشماری شبانه', 1],
-        ['manager', 'dorm:cleanliness:manage', 'نظارت بر رتبه‌بندی نظافت خوابگاه', 1],
+        ['manager', 'dorm:graph:view_all', 'مشاهده گراف جامع کل ساختمان، طبقات و ساکنان', 1],
+        ['manager', 'dorm:facilities:manage', 'تکمیل شناسنامه امکانات و تجهیزات اتاق‌ها', 1],
         ['manager', 'dorm:maintenance:resolve', 'رسیدگی به خرابی‌ها و ثبت فاکتور تعمیرات', 1],
+        ['manager', 'dorm:cleanliness:manage', 'نظارت بر رتبه‌بندی نظافت و خروجی اکسل', 1],
+        ['manager', 'dorm:allocations:manage', 'دانشجویان ساکن، تغییر اتاق و میهمانی', 1],
+        ['manager', 'dorm:student_panel:impersonate', 'ورود از کارت دانشجویی به پنل دانشجو (با حفظ نشست مدیر)', 1],
+        ['manager', 'dorm:supervisor_panel:impersonate', 'ورود از کارت سرپرست به پنل سرپرست شبانه (با حفظ نشست مدیر)', 1],
+        ['manager', 'dorm:attendance:manage', 'سرشماری شبانه، چاپ و خروجی اکسل', 1],
+        ['manager', 'dorm:supervisors:manage', 'مدیریت سرپرستان، شیفت‌ها و کاربران مدیر', 1],
+        ['manager', 'dorm:festivals:manage', 'جشنواره‌ها، داوطلبان و صدور فراخوان', 1],
+        ['manager', 'dorm:skills:view', 'مشاهده بانک مهارت‌ها و استعدادیابی', 1],
         ['manager', 'welfare:manage', 'مدیریت خدمات رفاهی و سانس‌های ورزشی', 1],
         ['manager', 'auth:tokens:manage', 'مدیریت توکن‌های JWT، ابطال نشست و ماتریس دسترسی', 1],
     ];
@@ -554,6 +622,29 @@ try {
     ");
     foreach ($defaultPerms as $permRow) {
         $stmtPermSeed->execute($permRow);
+    }
+
+    $jwtExecDdl("
+        CREATE TABLE IF NOT EXISTS `auth_user_permissions` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `subject_id` VARCHAR(64) NOT NULL,
+            `role` ENUM('student', 'supervisor', 'manager') NOT NULL,
+            `permission_key` VARCHAR(80) NOT NULL,
+            `is_allowed` TINYINT(1) NOT NULL DEFAULT 1,
+            `updated_by` VARCHAR(64) DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY `uk_user_perm` (`subject_id`, `role`, `permission_key`),
+            INDEX `idx_user_perm_sub` (`subject_id`, `role`)
+        )
+    ");
+
+    $chkAdminCreator = $pdo->query("SHOW COLUMNS FROM `admins` LIKE 'created_by_national_id'")->fetchAll();
+    if (empty($chkAdminCreator)) {
+        $pdo->exec("ALTER TABLE `admins` ADD COLUMN `created_by_national_id` VARCHAR(30) DEFAULT NULL AFTER `role`");
+    } else {
+        try {
+            $pdo->exec("ALTER TABLE `admins` MODIFY COLUMN `created_by_national_id` VARCHAR(30) DEFAULT NULL");
+        } catch (Exception $eCol2) {}
     }
 } catch (Exception $ex) {}
 
@@ -602,6 +693,69 @@ try {
     ");
 } catch (Exception $ex) {}
 
+// ۴-۵. جدول تنظیمات محدودیت اکشن‌های دانشجو (auth_student_action_limits) و گزارش مصرف (auth_student_action_logs)
+try {
+    $jwtExecDdl("
+        CREATE TABLE IF NOT EXISTS `auth_student_action_limits` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `action_key` VARCHAR(80) NOT NULL UNIQUE,
+            `action_label` VARCHAR(180) NOT NULL,
+            `permission_key` VARCHAR(80) NOT NULL,
+            `category` VARCHAR(60) NOT NULL,
+            `max_count` INT NOT NULL DEFAULT 1,
+            `window_days` INT NOT NULL DEFAULT 30,
+            `is_limit_enabled` TINYINT(1) NOT NULL DEFAULT 1,
+            `sort_order` INT NOT NULL DEFAULT 0,
+            `updated_by` VARCHAR(64) DEFAULT NULL,
+            `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+    ");
+    $jwtExecDdl("
+        CREATE TABLE IF NOT EXISTS `auth_student_action_logs` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `student_id` VARCHAR(20) NOT NULL,
+            `action_key` VARCHAR(80) NOT NULL,
+            `detail` VARCHAR(255) DEFAULT NULL,
+            `ip_address` VARCHAR(64) DEFAULT NULL,
+            `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
+            INDEX `idx_sal_student_action_time` (`student_id`, `action_key`, `created_at`),
+            INDEX `idx_sal_action_time` (`action_key`, `created_at`)
+        )
+    ");
+
+    $defaultStudentLimits = [
+        ['student:profile:change_mobile', 'تغییر شماره تلفن همراه دانشجو', 'student:profile:edit', 'پروفایل و هویت', 1, 30, 1, 10],
+        ['student:profile:change_password', 'تغییر کلمه عبور حساب دانشجویی', 'student:profile:edit', 'پروفایل و هویت', 2, 30, 1, 20],
+        ['dorm:guest_request:submit', 'ثبت درخواست اقامت میهمان در خوابگاه', 'dorm:guest_request:submit', 'خوابگاه و اسکان', 2, 30, 1, 30],
+        ['dorm:card:print', 'چاپ رسمی کارت هوشمند دانشجویی (A4)', 'dorm:card:view_self', 'خوابگاه و اسکان', 5, 30, 1, 40],
+        ['dorm:certificate:print', 'چاپ گواهی رسمی سکونت در خوابگاه (A4)', 'dorm:room:view_self', 'خوابگاه و اسکان', 3, 30, 1, 50],
+        ['dorm:graph:view_self', 'مشاهده و بارگذاری گراف تعاملی اتاق و هم‌اتاقی‌ها', 'dorm:graph:view_self', 'خوابگاه و اسکان', 60, 1, 1, 60],
+        ['welfare:wallet_charge', 'شارژ آنلاین کیف پول الکترونیک', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 5, 7, 1, 70],
+        ['welfare:book_gym', 'رزرو سانس سالن بدنسازی', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 4, 7, 1, 80],
+        ['welfare:gym_ticket:print', 'چاپ بلیت دیجیتال سالن بدنسازی (A4)', 'welfare:book', 'خدمات رفاهی و سالن بدنسازی', 10, 7, 1, 90],
+        ['skills:graph:view_self', 'مشاهده و بارگذاری نقشه گراف مهارت‌ها', 'skills:graph:view_self', 'گراف مهارت‌ها و علایق', 60, 1, 1, 100],
+        ['skills:graph:attach_domain', 'افزودن حوزه رسمی دانشگاه به گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 10, 30, 1, 110],
+        ['skills:graph:detach_domain', 'حذف / جدا کردن حوزه از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 10, 30, 1, 120],
+        ['skills:graph:create_node', 'ایجاد باکس جدید (مهارت / علاقه / دستاورد / رویداد)', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 15, 7, 1, 130],
+        ['skills:graph:update_node', 'ویرایش مشخصات باکس در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 140],
+        ['skills:graph:delete_node', 'حذف باکس شخصی از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 15, 7, 1, 150],
+        ['skills:graph:create_edge', 'ایجاد خط ارتباطی جدید در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 160],
+        ['skills:graph:update_edge', 'ویرایش خط ارتباطی در گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 30, 7, 1, 170],
+        ['skills:graph:delete_edge', 'حذف خط ارتباطی از گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 20, 7, 1, 180],
+        ['skills:graph:save_layout', 'ذخیره چیدمان و مختصات گراف مهارت‌ها', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 100, 1, 1, 190],
+        ['skills:graph:reset', 'بازنشانی کامل گراف مهارت‌ها به حالت پیش‌فرض', 'skills:graph:manage_self', 'گراف مهارت‌ها و علایق', 2, 30, 1, 200],
+        ['auth:jwt:refresh', 'تمدید و چرخش توکن JWT نشست دانشجو', 'student:profile:edit', 'امنیت و نشست JWT', 10, 1, 1, 210],
+    ];
+    $stmtLimSeed = $pdo->prepare("
+        INSERT IGNORE INTO `auth_student_action_limits`
+            (`action_key`, `action_label`, `permission_key`, `category`, `max_count`, `window_days`, `is_limit_enabled`, `sort_order`)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ");
+    foreach ($defaultStudentLimits as $limRow) {
+        $stmtLimSeed->execute($limRow);
+    }
+} catch (Exception $ex) {}
+
 // =========================================================================
 // ۵. جداول ماژول نقشه مهارت‌ها و علایق دانشجو (University Graph - Skills Module)
 // =========================================================================
@@ -621,24 +775,6 @@ try {
             `updated_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )
     ");
-
-    $defaultDomains = [
-        ['domain-tech', 'فناوری و برنامه‌نویسی', 'technology', 'توسعه نرم‌افزار، هوش مصنوعی، شبکه، پایگاه داده و وب', 'code', '#06b6d4', 1],
-        ['domain-edu', 'علمی و آموزشی', 'education', 'علوم پایه، دروس تخصصی، ریاضیات، فیزیک و زبان‌های خارجه', 'book', '#6366f1', 2],
-        ['domain-research', 'پژوهش و نوآوری', 'research', 'مقالات علمی، ثبت اختراع، پروژه‌های دانش‌بنیان و آزمایشگاهی', 'lightbulb', '#10b981', 3],
-        ['domain-sport', 'ورزش و تندرستی', 'sport', 'رشته‌های ورزشی تیمی و انفرادی، آمادگی جسمانی و مسابقات', 'activity', '#ef4444', 4],
-        ['domain-culture', 'فرهنگی و رسانه', 'culture', 'تولید محتوا، نشریات دانشجویی، عکاسی، فیلم و فعالیت‌های عمومی', 'palette', '#f59e0b', 5],
-        ['domain-art', 'هنر و طراحی', 'art', 'طراحی گرافیک، معماری، موسیقی، تدوین و هنرهای تجسمی', 'pen', '#ec4899', 6],
-        ['domain-quran', 'عترت و قرآن', 'quran', 'قرائت، حفظ، مفاهیم قرآنی و فعالیت‌های دینی و معارفی', 'bookmark', '#8b5cf6', 7],
-        ['domain-workshop', 'مهارت‌های فنی و کارگاهی', 'workshop', 'الکترونیک، ساخت و تولید، بردهای سخت‌افزاری و مکاترونیک', 'wrench', '#f97316', 8],
-    ];
-    $stmtDomSeed = $pdo->prepare("
-        INSERT IGNORE INTO `ug_domains` (`id`, `title`, `slug`, `description`, `icon`, `color`, `sort_order`, `is_active`)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-    ");
-    foreach ($defaultDomains as $domRow) {
-        $stmtDomSeed->execute($domRow);
-    }
 } catch (Exception $ex) {}
 
 try {
@@ -769,6 +905,39 @@ try {
             `after_data` TEXT DEFAULT NULL,
             `created_at` TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP,
             INDEX `idx_ug_audit_actor` (`actor_id`)
+        )
+    ");
+} catch (Exception $ex) {}
+
+// =========================================================================
+// ۶. جدول درخواست‌های اقامت میهمان دانشجویان (guest_dorm_requests)
+// =========================================================================
+try {
+    $jwtExecDdl("
+        CREATE TABLE IF NOT EXISTS `guest_dorm_requests` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `student_id` VARCHAR(20) NOT NULL,
+            `full_name` VARCHAR(150) NOT NULL,
+            `national_id` VARCHAR(20) NOT NULL,
+            `mobile` VARCHAR(20) DEFAULT NULL,
+            `field_of_study` VARCHAR(150) DEFAULT NULL,
+            `study_shift` VARCHAR(60) DEFAULT NULL,
+            `was_dorm_applicant` TINYINT(1) NOT NULL DEFAULT 0,
+            `has_active_allocation` TINYINT(1) NOT NULL DEFAULT 0,
+            `problem_description` TEXT NOT NULL,
+            `requested_days` INT NOT NULL DEFAULT 7,
+            `status` ENUM('pending', 'approved', 'rejected') NOT NULL DEFAULT 'pending',
+            `assigned_room_id` INT DEFAULT NULL,
+            `assigned_room_number` VARCHAR(20) DEFAULT NULL,
+            `approved_days` INT DEFAULT NULL,
+            `manager_note` TEXT DEFAULT NULL,
+            `reviewed_by_id` VARCHAR(64) DEFAULT NULL,
+            `reviewed_by_name` VARCHAR(150) DEFAULT NULL,
+            `reviewed_at` DATETIME DEFAULT NULL,
+            `created_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX `idx_gdr_student` (`student_id`),
+            INDEX `idx_gdr_status` (`status`)
         )
     ");
 } catch (Exception $ex) {}
